@@ -31,6 +31,22 @@ import traceback
 from pyhss_config import config
 
 
+geored_config_changed = None
+
+def geored_check_updated_endpoints(config):
+    global geored_config_changed
+    update_file = config.get('geored', {}).get('update_file', '/tmp/pyhss_geored_endpoints.txt')
+    if update_file and update_file != '':
+        if os.path.isfile(update_file):
+            if (geored_config_changed != os.path.getmtime(update_file)):
+                print(f"Geored config updated: {geored_config_changed}")
+                try:
+                    config.get('geored', {})['endpoints'] = yaml.safe_load(open(update_file, 'r'))
+                    geored_config_changed = os.path.getmtime(update_file)
+                except:
+                    print(f"Error reading updated endpoints from {update_file}")
+    return config.get('geored', {}).get('endpoints', [])
+
 Base = declarative_base()
 class APN(Base):
     __tablename__ = 'apn'
@@ -971,8 +987,9 @@ class Database:
                 return
             georedDict = {}
             if config.get('geored', {}).get('enabled', False):
-                if config.get('geored', {}).get('endpoints', []) is not None:
-                    if len(config.get('geored', {}).get('endpoints', [])) > 0:
+                geored_endpoints = geored_check_updated_endpoints(config)
+                if geored_endpoints is not None:
+                    if len(geored_endpoints) > 0:
                         georedDict['body'] = jsonData
                         georedDict['operation'] = operation
                         georedDict['timestamp'] = time.time_ns()
@@ -2145,6 +2162,10 @@ class Database:
                     assert(len(serving_pgw) > 0)
                     assert("None" not in serving_pgw)
                     
+                    if ServingAPN and ((subscriber_routing == "None") or (subscriber_routing == "") or (subscriber_routing == "Failed to Decode / Get UE IP") or (subscriber_routing == None)):
+                        json_data['subscriber_routing'] = ServingAPN['subscriber_routing']
+                        self.logTool.log(service='Database', level='debug', message="Using existing subscriber routing from Serving APN", redisClient=self.redisMessaging)
+
                     self.UpdateObj(SERVING_APN, json_data, ServingAPN['serving_apn_id'], True)
                     objectData = self.GetObj(SERVING_APN, ServingAPN['serving_apn_id'])
                     self.handleWebhook(objectData, 'PATCH')
