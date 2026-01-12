@@ -341,7 +341,7 @@ class GeoredService:
 
                 socketSession = aiohttp.ClientSession(connector=aiohttp.TCPConnector(ssl=False))
                 async with socketSession as session:
-                    self.georedPeers = geored_check_updated_endpoints(self.config)
+                    self.georedPeers = geored_check_updated_endpoints(config)
                     for remotePeer in self.georedPeers:
                         georedTasks.append(self.sendGeored(asyncSession=session, url=remotePeer+'/geored/', operation=georedOperation, body=georedBody))
                     await asyncio.gather(*georedTasks)
@@ -411,7 +411,7 @@ class GeoredService:
             georedEnabled = config.get('geored', {}).get('enabled', False)
             webhooksEnabled = config.get('webhooks', {}).get('enabled', False)
 
-            self.georedPeers = geored_check_updated_endpoints(self.config)
+            self.georedPeers = geored_check_updated_endpoints(config)
             if self.georedPeers is not None:
                 if not len(self.georedPeers) > 0:
                     georedEnabled = False
