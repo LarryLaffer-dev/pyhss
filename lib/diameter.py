@@ -120,7 +120,7 @@ class Diameter:
         ]
         
         # Only add Zn commands if enabled in config
-        if self.config.get('hss', {}).get('Zn_enabled', False):
+        if config.get('hss', {}).get('Zn_enabled', False):
             self.diameterResponseList.extend(zn_commands)
             self.logTool.log(service='HSS', level='info', 
                            message="Zn-Interface commands added to Diameter command list",
