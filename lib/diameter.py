@@ -103,27 +103,20 @@ class Diameter:
 
                 # SLh LCS
                 {"commandCode": 8388622, "applicationId": 16777291, "responseMethod": self.Answer_16777291_8388622, "failureResultCode": 4100 ,"requestAcronym": "LRR", "responseAcronym": "LRA", "requestName": "LCS Routing Info Request", "responseName": "LCS Routing Info Answer"},
-
-                # Zn MAR
-                {"commandCode": 303, "applicationId": 16777220, "responseMethod": self.Answer_16777220_303, "requestAcronym": "MAR", "responseAcronym": "MAA"}
             ]
 
-    
-        # Add Zh/Zn Interface commands (Application ID: 16777220)
-        # These are added separately to make the Zn addition clear
-        zn_commands = [
-            {"commandCode": 303, "applicationId": 16777220, 
-             "responseMethod": self.Answer_16777220_303, "failureResultCode": 5001,
-             "requestAcronym": "MAR", "responseAcronym": "MAA", 
-             "requestName": "Multimedia Authentication Request (Zn)", 
-             "responseName": "Multimedia Authentication Answer (Zn)"},
-        ]
-        
-        # Only add Zn commands if enabled in config
-        if self.config.get('hss', {}).get('Zn_enabled', False):
-            self.diameterResponseList.extend(zn_commands)
+        # Add Zh/Zn Interface commands (Application ID: 16777220) if enabled
+        # Implements 3GPP TS 29.109 for GBA (Generic Bootstrapping Architecture)
+        if config.get('hss', {}).get('Zn_enabled', False):
+            self.diameterResponseList.append(
+                {"commandCode": 303, "applicationId": 16777220, 
+                 "responseMethod": self.Answer_16777220_303, "failureResultCode": 5001,
+                 "requestAcronym": "MAR", "responseAcronym": "MAA", 
+                 "requestName": "Multimedia Authentication Request (Zn)", 
+                 "responseName": "Multimedia Authentication Answer (Zn)"}
+            )
             self.logTool.log(service='HSS', level='info', 
-                           message="Zn-Interface commands added to Diameter command list",
+                           message="Zn-Interface (GBA) enabled - MAR/MAA command registered",
                            redisClient=self.redisMessaging)
             self._initialize_zn_interface()
 

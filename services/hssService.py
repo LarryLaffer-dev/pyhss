@@ -12,7 +12,6 @@ from logtool import LogTool
 from baseModels import Peer, InboundData, OutboundData
 import pydantic_core
 from pyhss_config import config
-from zn_interface import initialize_zn_interface, ZnInterface, ZnDiameterExtension
 
 
 class HssService:
@@ -31,36 +30,11 @@ class HssService:
         self.originHost = config.get('hss', {}).get('OriginHost', f'hss01')
         self.productName = config.get('hss', {}).get('ProductName', f'PyHSS')
         self.logTool.log(service='HSS', level='info', message=f"{self.banners.hssService()}", redisClient=self.redisMessaging)
+        # Diameter library handles Zn-Interface initialization internally if Zn_enabled is True in config
         self.diameterLibrary = Diameter(logTool=self.logTool, originHost=self.originHost, originRealm=self.originRealm, productName=self.productName, mcc=self.mcc, mnc=self.mnc)
         self.benchmarking = config.get('hss').get('enable_benchmarking', False)
         self.hostname = self.originHost
         self.diameterPeerKey = config.get('hss', {}).get('diameter_peer_key', 'diameterPeers')
-
-        # Zn-Interface initialization (if enabled)
-        zn_enabled = config.get('hss', {}).get('Zn_enabled', False)
-        if zn_enabled:
-            self.logTool.log(
-                service='HSS',
-                level='info',
-                message="Zn-Interface is enabled, initializing...",
-                redisClient=self.redisMessaging
-            )
-            try:
-                zn_extension, zn_interface = initialize_zn_interface(self.diameterLibrary, config)
-                self.logTool.log(
-                    service='HSS',
-                    level='info',
-                    message="Zn-Interface successfully initialized and registered",
-                    redisClient=self.redisMessaging
-                )
-            except Exception as e:
-                self.logTool.log(
-                    service='HSS',
-                    level='error',
-                    message=f"Failed to initialize Zn-Interface: {str(e)}",
-                    redisClient=self.redisMessaging
-                )
-                raise
 
     def handleQueue(self):
         """
