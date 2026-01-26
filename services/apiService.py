@@ -60,7 +60,7 @@ diameterClient = Diameter(
                     productName='PyHSS-client-API'
                 )
 
-databaseClient = database.Database(logTool=logTool, redisMessaging=redisMessaging)
+databaseClient = database.Database(logTool=logTool, redisMessaging=redisMessaging, main_service=True)
 
 enumClient = ENUMClient(config=config, log_tool=logTool, redis_messaging=redisMessaging)
 
