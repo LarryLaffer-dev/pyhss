@@ -57,7 +57,8 @@ diameterClient = Diameter(
                     originRealm=originRealm, 
                     mnc=mnc,
                     mcc=mcc,
-                    productName='PyHSS-client-API'
+                    productName='PyHSS-client-API',
+                    main_service=True
                 )
 
 databaseClient = database.Database(logTool=logTool, redisMessaging=redisMessaging, main_service=True)
