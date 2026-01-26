@@ -8,6 +8,7 @@ import sys
 import json
 from flask import Flask, request, jsonify, Response
 from flask_restx import Api, Resource, fields, reqparse, abort
+from database import geored_check_updated_endpoints
 from werkzeug.middleware.proxy_fix import ProxyFix
 from functools import wraps
 import os
@@ -25,6 +26,7 @@ from messaging import RedisMessaging
 from baseModels import SubscriberInfo
 import database
 from pyhss_config import config
+from enum_management import ENUMClient, ENUMManagementError
 
 
 siteName = config.get("hss", {}).get("site_name", "")
@@ -59,6 +61,8 @@ diameterClient = Diameter(
                 )
 
 databaseClient = database.Database(logTool=logTool, redisMessaging=redisMessaging)
+
+enumClient = ENUMClient(config=config, log_tool=logTool, redis_messaging=redisMessaging)
 
 apiService = Flask(__name__)
 
@@ -214,6 +218,7 @@ GeoRed_model = api.model('GeoRed', {
     'serving_pgw_realm' : fields.String(description=Serving_APN.serving_pgw_realm.doc),
     'serving_pgw_peer' : fields.String(description=Serving_APN.serving_pgw_peer.doc),
     'serving_pgw_timestamp' : fields.String(description=Serving_APN.serving_pgw_timestamp.doc),
+    'af_subscriptions' : fields.String(description=Serving_APN.af_subscriptions.doc),
     'scscf' : fields.String(description=IMS_SUBSCRIBER.scscf.doc),
     'scscf_realm' : fields.String(description=IMS_SUBSCRIBER.scscf_realm.doc),
     'scscf_peer' : fields.String(description=IMS_SUBSCRIBER.scscf_peer.doc),
@@ -726,9 +731,22 @@ class PyHSS_IMS_SUBSCRIBER_Get(Resource):
     def delete(self, ims_subscriber_id):
         '''Delete all data for specified ims_subscriber_id'''
         try:
+            # Get subscriber data before deletion to know which ENUM entries to remove
+            subscriber_data = databaseClient.GetObj(IMS_SUBSCRIBER, ims_subscriber_id)
+            msisdn = subscriber_data.get('msisdn')
+            msisdn_list = subscriber_data.get('msisdn_list')
+
             args = parser.parse_args()
             operation_id = args.get('operation_id', None)
             data = databaseClient.DeleteObj(IMS_SUBSCRIBER, ims_subscriber_id, False, operation_id)
+
+            # Delete ENUM entries after subscriber deletion
+            try:
+                enumClient.delete_enum_entries(msisdn=msisdn, msisdn_list=msisdn_list)
+            except ENUMManagementError as enum_error:
+                # In strict mode, log the error but don't fail - subscriber is already deleted
+                logTool.log(service='API', level='error', message=f"[API] ENUM deletion failed after subscriber deletion: {enum_error}", redisClient=redisMessaging)
+
             return data, 200
         except Exception as E:
             print(E)
@@ -743,10 +761,31 @@ class PyHSS_IMS_SUBSCRIBER_Get(Resource):
             if 'msisdn' in json_data:
                 json_data['msisdn'] = json_data['msisdn'].replace('+', '')
             if 'msisdn_list' in json_data:
-                json_data['msisdn_list'] = json_data['msisdn_list'].replace('+', '')
+                if json_data['msisdn_list'] != None:
+                    json_data['msisdn_list'] = json_data['msisdn_list'].replace('+', '')
+
+            # Get current subscriber data before update to compare MSISDNs
+            old_subscriber = databaseClient.GetObj(IMS_SUBSCRIBER, ims_subscriber_id)
+            old_msisdn = old_subscriber.get('msisdn')
+            old_msisdn_list = old_subscriber.get('msisdn_list')
+
             args = parser.parse_args()
             operation_id = args.get('operation_id', None)
             data = databaseClient.UpdateObj(IMS_SUBSCRIBER, json_data, ims_subscriber_id, False, operation_id)
+
+            # Update ENUM entries if MSISDNs changed
+            new_msisdn = data.get('msisdn')
+            new_msisdn_list = data.get('msisdn_list')
+            try:
+                enumClient.update_enum_entries(
+                    old_msisdn=old_msisdn,
+                    old_msisdn_list=old_msisdn_list,
+                    new_msisdn=new_msisdn,
+                    new_msisdn_list=new_msisdn_list
+                )
+            except ENUMManagementError as enum_error:
+                # In strict mode, log but don't fail - subscriber is already updated
+                logTool.log(service='API', level='error', message=f"[API] ENUM update failed: {enum_error}", redisClient=redisMessaging)
 
             return data, 200
         except Exception as E:
@@ -764,10 +803,23 @@ class PyHSS_IMS_SUBSCRIBER(Resource):
             if 'msisdn' in json_data:
                 json_data['msisdn'] = json_data['msisdn'].replace('+', '')
             if 'msisdn_list' in json_data:
-                json_data['msisdn_list'] = json_data['msisdn_list'].replace('+', '')
+                if json_data['msisdn_list'] != None:
+                    json_data['msisdn_list'] = json_data['msisdn_list'].replace('+', '')
             args = parser.parse_args()
             operation_id = args.get('operation_id', None)
             data = databaseClient.CreateObj(IMS_SUBSCRIBER, json_data, False, operation_id)
+
+            # Create ENUM entries for the new subscriber
+            try:
+                enumClient.create_enum_entries(
+                    msisdn=json_data.get('msisdn'),
+                    msisdn_list=json_data.get('msisdn_list')
+                )
+            except ENUMManagementError as enum_error:
+                # In strict mode, ENUM errors are raised - rollback subscriber creation
+                logTool.log(service='API', level='error', message=f"[API] ENUM creation failed, rolling back subscriber: {enum_error}", redisClient=redisMessaging)
+                databaseClient.DeleteObj(IMS_SUBSCRIBER, data.get('ims_subscriber_id'), False, operation_id)
+                return {"error": f"ENUM creation failed: {str(enum_error)}"}, 500
 
             return data, 200
         except Exception as E:
@@ -1539,7 +1591,9 @@ class PyHSS_OAM_Reconcile_IMS(Resource):
                 if 'cscf' in keys:
                     response_dict['localhost'][keys] = local_result[keys]
 
-            for remote_HSS in config['geored']['sync_endpoints']:
+            #Get remote HSS results
+            remote_peers = config.get('geored', {}).get('sync_endpoints', geored_check_updated_endpoints(config))
+            for remote_HSS in remote_peers:
                 print("Pulling data from remote HSS: " + str(remote_HSS))
                 try:
                     response = requests.get(remote_HSS + '/ims_subscriber/ims_subscriber_imsi/' + str(imsi))
@@ -1569,6 +1623,20 @@ class PyHSS_OAM_Reconcile_IMS(Resource):
             return response_dict, 200
         except Exception as E:
             print(E)
+            return handle_exception(E)
+
+@ns_oam.route('/reconcile/enum')
+class PyHSS_OAM_Reconcile_ENUM(Resource):
+    def get(self):
+        '''Reconcile ENUM entries - recreate all NAPTR records from IMS subscriber database'''
+        try:
+            result = enumClient.reconcile_all(databaseClient)
+            if result.get('status') == 'error':
+                return result, 500
+            return result, 200
+        except Exception as E:
+            print(E)
+            logTool.log(service='API', level='error', message=f"[API] ENUM reconciliation failed: {traceback.format_exc()}", redisClient=redisMessaging)
             return handle_exception(E)
 
 @ns_pcrf.route('/pcrf_subscriber/list')
@@ -2062,6 +2130,15 @@ class PyHSS_Geored(Resource):
                                     usePrefix=True, 
                                     prefixHostname=originHostname, 
                                     prefixServiceName='metric')
+
+            if 'af_subscriptions' in json_data:
+                print("Updating af_subscriptions of serving APN")
+                response_data.append(databaseClient.Update_AF_Suscriptions(
+                    imsi=str(json_data['imsi']), 
+                    serving_apn=json_data['serving_apn'],
+                    af_subscriptions=json_data['af_subscriptions'],
+                    propate=False))
+
             if 'last_seen_mcc' in json_data:
                 print("Updating Subscriber Location")
                 response_data.append(databaseClient.update_subscriber_location(imsi=str(json_data['imsi']),
@@ -2274,6 +2351,30 @@ class PyHSS_Geored(Resource):
 
 @ns_geored.route('/peers')
 class PyHSS_Geored_Peers(Resource):
+    def patch(self):
+        '''Update the configured geored peers'''
+        try:
+            json_data = request.get_json(force=True)
+            print("JSON Data sent: " + str(json_data))
+            georedEnabled = config.get('geored', {}).get('enabled', False)
+            if not georedEnabled:
+                return {'result': 'Failed', 'Reason' : "Geored not enabled"}
+            if 'endpoints' not in json_data:
+                return {'result': 'Failed', 'Reason' : "No endpoints in request"}
+            if not isinstance(json_data['endpoints'], list):
+                return {'result': 'Failed', 'Reason' : "Endpoints must be a list"}
+            config['geored']['endpoints'] = json_data['endpoints']
+            update_file = config.get('geored', {}).get('update_file', '/tmp/pyhss_geored_endpoints.txt')
+            if update_file and update_file != '':
+                # Writing the data to a YAML file
+                with open(update_file, 'w') as file:
+                    yaml.dump(config['geored']['endpoints'], file)
+
+            return {'result': 'Success'}, 200
+        except Exception as E:
+            print("Exception when updating geored peers: " + str(E))
+            response_json = {'result': 'Failed', 'Reason' : "Unable to update Geored peers: " + str(E)}
+            return response_json
     def get(self):
         '''Return the configured geored peers'''
         try:
