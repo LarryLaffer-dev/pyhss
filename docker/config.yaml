@@ -93,6 +93,15 @@ hss:
     bind_ip: "${HSS_GSUP_BIND_IP:-0.0.0.0}"
     bind_port: ${HSS_GSUP_BIND_PORT:-4222}
 
+  # IFC Template Configuration (backward compatible)
+  ifc_templates:
+    # Whether to use database-stored templates (True) or file-based templates (False/default)
+    use_database: ${HSS_IFC_TEMPLATES_USE_DATABASE:-False}
+    # Whether to cache compiled Jinja2 templates (works for both modes)
+    cache_enabled: ${HSS_IFC_TEMPLATES_CACHE_ENABLED:-True}
+    # Default template path when ifc_path/ifc_template_id is not set
+    default_template_path: "${HSS_IFC_TEMPLATES_DEFAULT_TEMPLATE_PATH:-default_ifc.xml}"
+
 api:
   page_size: ${API_PAGE_SIZE:-200}
   # Whether or not to return key-based data when querying the AUC. Disable in production systems.

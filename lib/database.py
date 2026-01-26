@@ -157,7 +157,8 @@ class IMS_SUBSCRIBER(Base):
     msisdn = Column(String(18), unique=True, doc=SUBSCRIBER.msisdn.doc)
     msisdn_list = Column(String(1200), doc='Comma Separated list of additional MSISDNs for Subscriber')
     imsi = Column(String(18), unique=False, doc=SUBSCRIBER.imsi.doc)
-    ifc_path = Column(String(512), doc='Path to template file for the Initial Filter Criteria')
+    ifc_path = Column(String(512), doc='Path to template file for the Initial Filter Criteria (deprecated, use ifc_template_id)')
+    ifc_template_id = Column(Integer, ForeignKey('ifc_template.ifc_template_id'), doc='Reference to IFC Template in database')
     pcscf = Column(String(512), doc='Proxy-CSCF serving this subscriber')
     pcscf_realm = Column(String(512), doc='Realm of PCSCF')
     pcscf_active_session = Column(String(512), doc='Session Id for the PCSCF when in a call')
@@ -271,6 +272,19 @@ class SUBSCRIBER_ATTRIBUTES(Base):
     value = Column(String(12000), doc='Arbitrary value')
     operation_logs = relationship("SUBSCRIBER_ATTRIBUTES_OPERATION_LOG", back_populates="subscriber_attributes")
 
+class IFC_TEMPLATE(Base):
+    __tablename__ = 'ifc_template'
+    ifc_template_id = Column(Integer, primary_key=True, doc='Unique ID of IFC Template')
+    name = Column(String(256), unique=True, nullable=False, doc='Unique name for the template')
+    description = Column(String(1024), doc='Optional description of the template')
+    # Use Text for large template content - conditional based on database type
+    if 'mysql' in str(config['database']['db_type']).lower():
+        template_content = Column(Text(65535), nullable=False, doc='Jinja2 XML template content')
+    else:
+        template_content = Column(Text, nullable=False, doc='Jinja2 XML template content')
+    last_modified = Column(String(100), default=datetime.datetime.now(tz=timezone.utc), doc='Timestamp of last modification')
+    operation_logs = relationship("IFC_TEMPLATE_OPERATION_LOG", back_populates="ifc_template")
+
 class OPERATION_LOG_BASE(Base):
     __tablename__ = 'operation_log'
     id = Column(Integer, primary_key=True)
@@ -352,6 +366,11 @@ class SUBSCRIBER_ATTRIBUTES_OPERATION_LOG(OPERATION_LOG_BASE):
     __mapper_args__ = {'polymorphic_identity': 'subscriber_attributes'}
     subscriber_attributes = relationship("SUBSCRIBER_ATTRIBUTES", back_populates="operation_logs")
     subscriber_attributes_id = Column(Integer, ForeignKey('subscriber_attributes.subscriber_attributes_id'))
+
+class IFC_TEMPLATE_OPERATION_LOG(OPERATION_LOG_BASE):
+    __mapper_args__ = {'polymorphic_identity': 'ifc_template'}
+    ifc_template = relationship("IFC_TEMPLATE", back_populates="operation_logs")
+    ifc_template_id = Column(Integer, ForeignKey('ifc_template.ifc_template_id'))
 
 
 class Database:
@@ -1737,6 +1756,21 @@ class Database:
         result.pop('_sa_instance_state')
         self.safe_close(session)
         return result 
+
+    def Get_IFC_Template_by_Name(self, name):
+        """Get an IFC template by its unique name."""
+        self.logTool.log(service='Database', level='debug', message="Getting IFC Template named " + str(name), redisClient=self.redisMessaging)
+        Session = sessionmaker(bind=self.engine)
+        session = Session()    
+        try:
+            result = session.query(IFC_TEMPLATE).filter_by(name=str(name)).one()
+        except Exception as E:
+            self.safe_close(session)
+            raise ValueError(E)
+        result = result.__dict__
+        result.pop('_sa_instance_state')
+        self.safe_close(session)
+        return result
 
     def Update_AuC(self, auc_id, sqn=1, propagate=True):
         self.logTool.log(service='Database', level='debug', message=f"Updating AuC record for ID: {auc_id}", redisClient=self.redisMessaging)
