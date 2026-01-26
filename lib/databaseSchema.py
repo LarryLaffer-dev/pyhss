@@ -216,8 +216,9 @@ class DatabaseSchema:
         if self.get_version() >= 2:
             return
         self.upgrade_msg(2)
-        # Create the ifc_template table
-        self.base.metadata.tables["ifc_template"].create(bind=self.engine)
+        # Create the ifc_template table (check if exists to handle race conditions)
+        if not self.table_exists("ifc_template"):
+            self.base.metadata.tables["ifc_template"].create(bind=self.engine)
         # Add foreign key column to ims_subscriber
         self.add_column("ims_subscriber", "ifc_template_id", "INTEGER")
         # Add foreign key column to operation_log for IFC_TEMPLATE_OPERATION_LOG
