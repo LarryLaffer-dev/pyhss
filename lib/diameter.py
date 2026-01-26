@@ -10,8 +10,9 @@ import os
 import random
 import ipaddress
 import jinja2
-from database import Database, ROAMING_NETWORK, ROAMING_RULE, EMERGENCY_SUBSCRIBER, IMS_SUBSCRIBER, geored_check_updated_endpoints
+from database import Database, ROAMING_NETWORK, ROAMING_RULE, EMERGENCY_SUBSCRIBER, IMS_SUBSCRIBER, geored_check_updated_endpoints, IFC_TEMPLATE
 from messaging import RedisMessaging
+from template_cache import get_template_cache
 from redis import Redis
 import datetime
 import json
@@ -29,7 +30,17 @@ from ast import literal_eval
 
 class Diameter:
 
-    def __init__(self, logTool, originHost: str="hss01", originRealm: str="epc.mnc999.mcc999.3gppnetwork.org", productName: str="PyHSS", mcc: str="999", mnc: str="999", redisMessaging=None):
+    def __init__(
+        self,
+        logTool,
+        originHost: str = "hss01",
+        originRealm: str = "epc.mnc999.mcc999.3gppnetwork.org",
+        productName: str = "PyHSS",
+        mcc: str = "999",
+        mnc: str = "999",
+        redisMessaging=None,
+        main_service: bool = False,
+    ):
         self.OriginHost = self.string_to_hex(originHost)
         self.OriginRealm = self.string_to_hex(originRealm)
         self.ProductName = self.string_to_hex(productName)
@@ -49,7 +60,7 @@ class Diameter:
         
         self.hostname = socket.gethostname()
 
-        self.database = Database(logTool=logTool)
+        self.database = Database(logTool=logTool, main_service=main_service)
         self.diameterRequestTimeout = int(config.get('hss', {}).get('diameter_request_timeout', 10))
         self.diameterPeerKey = config.get('hss', {}).get('diameter_peer_key', 'diameterPeers')
         self.useDraFallback = config.get('hss', {}).get('use_dra_fallback', False)
@@ -60,6 +71,12 @@ class Diameter:
 
         self.templateLoader = jinja2.FileSystemLoader(searchpath="../")
         self.templateEnv = jinja2.Environment(loader=self.templateLoader)
+        
+        # Initialize IFC template cache
+        self.ifcTemplateCache = get_template_cache(logTool=logTool, redisMessaging=self.redisMessaging)
+        self.ifcCacheEnabled = config.get('hss', {}).get('ifc_templates', {}).get('cache_enabled', True)
+        self.ifcUseDatabase = config.get('hss', {}).get('ifc_templates', {}).get('use_database', False)
+        self.ifcDefaultTemplatePath = config.get('hss', {}).get('ifc_templates', {}).get('default_template_path', 'default_ifc.xml')
 
         self.logTool.log(service='HSS', level='info', message=f"Initialized Diameter Library", redisClient=self.redisMessaging)
         self.logTool.log(service='HSS', level='info', message=f"Origin Host: {str(originHost)}", redisClient=self.redisMessaging)
@@ -3138,15 +3155,36 @@ class Diameter:
         avp += self.generate_avp(1, 40, str(binascii.hexlify(str.encode(str(imsi) + '@' + str(domain))),'ascii'))
         #Cx-User-Data (XML)
         
-        #This loads a Jinja XML template as the default iFC
-        templateLoader = jinja2.FileSystemLoader(searchpath=["/templates/", "../", "/"])
-        templateEnv = jinja2.Environment(loader=templateLoader)
-        self.logTool.log(service='HSS', level='debug', message="Loading iFC from path " + str(ims_subscriber_details['ifc_path']), redisClient=self.redisMessaging)
-        template = templateEnv.get_template(ims_subscriber_details['ifc_path'])
-        
         #These variables are passed to the template for use
         ims_subscriber_details['mnc'] = self.MNC.zfill(3)
         ims_subscriber_details['mcc'] = self.MCC.zfill(3)
+        
+        # Load iFC template using cache (with config-based source selection)
+        template = None
+        if self.ifcCacheEnabled:
+            # Use the template cache for optimized loading
+            template = self.ifcTemplateCache.get_template(ims_subscriber_details, config, self.database)
+        else:
+            # Direct loading without cache (not recommended for production)
+            if self.ifcUseDatabase and ims_subscriber_details.get('ifc_template_id'):
+                # Load from database
+                template_id = ims_subscriber_details['ifc_template_id']
+                self.logTool.log(service='HSS', level='debug', message=f"Loading iFC from database template ID {template_id}", redisClient=self.redisMessaging)
+                template_data = self.database.GetObj(IFC_TEMPLATE, template_id)
+                if template_data and 'template_content' in template_data:
+                    template = jinja2.Template(template_data['template_content'])
+            
+            if template is None:
+                # Fall back to file-based loading
+                ifc_path = ims_subscriber_details.get('ifc_path') or self.ifcDefaultTemplatePath
+                self.logTool.log(service='HSS', level='debug', message="Loading iFC from path " + str(ifc_path), redisClient=self.redisMessaging)
+                templateLoader = jinja2.FileSystemLoader(searchpath="../")
+                templateEnv = jinja2.Environment(loader=templateLoader)
+                template = templateEnv.get_template(ifc_path)
+        
+        if template is None:
+            self.logTool.log(service='HSS', level='error', message="Failed to load iFC template", redisClient=self.redisMessaging)
+            raise ValueError("Failed to load iFC template")
 
         xmlbody = template.render(iFC_vars=ims_subscriber_details)  # this is where to put args to the template renderer
         avp += self.generate_vendor_avp(606, "c0", 10415, str(binascii.hexlify(str.encode(xmlbody)),'ascii'))

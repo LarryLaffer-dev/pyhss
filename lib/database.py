@@ -2,14 +2,14 @@
 # Copyright 2023-2025 David Kneipp <david@davidkneipp.com>
 # Copyright 2024-2025 Lennart Rosam <hello@takuto.de>
 # Copyright 2024-2025 Alexander Couzens <lynxis@fe80.eu>
+# Copyright 2025 sysmocom - s.f.m.c. GmbH <info@sysmocom.de>
 # SPDX-License-Identifier: AGPL-3.0-or-later
 from typing import Optional
 
+import sqlalchemy
 from sqlalchemy import Column, Integer, String, MetaData, Table, Boolean, ForeignKey, select, UniqueConstraint, DateTime, BigInteger, Text, DateTime, Float
-from sqlalchemy import create_engine, inspect
-from sqlalchemy.engine.reflection import Inspector
+from sqlalchemy import create_engine
 from sqlalchemy.sql import desc, func
-from sqlalchemy_utils import database_exists, create_database
 from sqlalchemy.orm import sessionmaker, relationship, Session, class_mapper
 from sqlalchemy.orm.attributes import History, get_history
 from sqlalchemy.orm import declarative_base
@@ -22,6 +22,7 @@ import uuid
 import socket
 import pprint
 import S6a_crypt
+from databaseSchema import DatabaseSchema
 from baseModels import SubscriberInfo, LocationInfo2G
 from gsup.protocol.ipa_peer import IPAPeerRole
 from messaging import RedisMessaging
@@ -48,6 +49,13 @@ def geored_check_updated_endpoints(config):
     return config.get('geored', {}).get('endpoints', [])
 
 Base = declarative_base()
+
+class DATABASE_SCHEMA_VERSION(Base):
+    __tablename__ = "database_schema_version"
+    upgrade_id = Column(Integer, primary_key=True, doc="Schema version")
+    comment = Column(String(512), doc="Notes about this version upgrade")
+    date = Column(DateTime(timezone=True), server_default=sqlalchemy.sql.func.now(), doc="When the upgrade was done")
+
 class APN(Base):
     __tablename__ = 'apn'
     apn_id = Column(Integer, primary_key=True, doc='Unique ID of APN')
@@ -174,7 +182,8 @@ class IMS_SUBSCRIBER(Base):
     msisdn = Column(String(18), unique=True, doc=SUBSCRIBER.msisdn.doc)
     msisdn_list = Column(String(1200), doc='Comma Separated list of additional MSISDNs for Subscriber')
     imsi = Column(String(18), unique=False, doc=SUBSCRIBER.imsi.doc)
-    ifc_path = Column(String(512), doc='Path to template file for the Initial Filter Criteria')
+    ifc_path = Column(String(512), doc='Path to template file for the Initial Filter Criteria (deprecated, use ifc_template_id)')
+    ifc_template_id = Column(Integer, ForeignKey('ifc_template.ifc_template_id'), doc='Reference to IFC Template in database')
     pcscf = Column(String(512), doc='Proxy-CSCF serving this subscriber')
     pcscf_realm = Column(String(512), doc='Realm of PCSCF')
     pcscf_active_session = Column(String(512), doc='Session Id for the PCSCF when in a call')
@@ -288,6 +297,19 @@ class SUBSCRIBER_ATTRIBUTES(Base):
     value = Column(String(12000), doc='Arbitrary value')
     operation_logs = relationship("SUBSCRIBER_ATTRIBUTES_OPERATION_LOG", back_populates="subscriber_attributes")
 
+class IFC_TEMPLATE(Base):
+    __tablename__ = 'ifc_template'
+    ifc_template_id = Column(Integer, primary_key=True, doc='Unique ID of IFC Template')
+    name = Column(String(256), unique=True, nullable=False, doc='Unique name for the template')
+    description = Column(String(1024), doc='Optional description of the template')
+    # Use Text for large template content - conditional based on database type
+    if 'mysql' in str(config['database']['db_type']).lower():
+        template_content = Column(Text(65535), nullable=False, doc='Jinja2 XML template content')
+    else:
+        template_content = Column(Text, nullable=False, doc='Jinja2 XML template content')
+    last_modified = Column(String(100), default=datetime.datetime.now(tz=timezone.utc), doc='Timestamp of last modification')
+    operation_logs = relationship("IFC_TEMPLATE_OPERATION_LOG", back_populates="ifc_template")
+
 class OPERATION_LOG_BASE(Base):
     __tablename__ = 'operation_log'
     id = Column(Integer, primary_key=True)
@@ -370,10 +392,15 @@ class SUBSCRIBER_ATTRIBUTES_OPERATION_LOG(OPERATION_LOG_BASE):
     subscriber_attributes = relationship("SUBSCRIBER_ATTRIBUTES", back_populates="operation_logs")
     subscriber_attributes_id = Column(Integer, ForeignKey('subscriber_attributes.subscriber_attributes_id'))
 
+class IFC_TEMPLATE_OPERATION_LOG(OPERATION_LOG_BASE):
+    __mapper_args__ = {'polymorphic_identity': 'ifc_template'}
+    ifc_template = relationship("IFC_TEMPLATE", back_populates="operation_logs")
+    ifc_template_id = Column(Integer, ForeignKey('ifc_template.ifc_template_id'))
+
 
 class Database:
 
-    def __init__(self, logTool, redisMessaging=None):
+    def __init__(self, logTool, redisMessaging=None, main_service: bool = False):
 
         self.redisUseUnixSocket = config.get('redis', {}).get('useUnixSocket', False)
         self.redisUnixSocketPath = config.get('redis', {}).get('unixSocketPath', '/var/run/redis/redis-server.sock')
@@ -412,13 +439,7 @@ class Database:
             pool_size=config['logging'].get('sqlalchemy_pool_size', 30),
             max_overflow=config['logging'].get('sqlalchemy_max_overflow', 0))
 
-        # Create database if it does not exist.
-        if not database_exists(self.engine.url):
-            self.logTool.log(service='Database', level='debug', message="Creating database", redisClient=self.redisMessaging)
-            create_database(self.engine.url)
-            Base.metadata.create_all(self.engine)
-        else:
-            self.logTool.log(service='Database', level='debug', message="Database already created", redisClient=self.redisMessaging)
+        DatabaseSchema(self.logTool, Base, self.engine, main_service)
 
         #Load IMEI TAC database into Redis if enabled
         if self.tacDatabasePath:
@@ -427,15 +448,6 @@ class Database:
         else:
             self.logTool.log(service='Database', level='info', message="Not loading EIR IMEI TAC Database as Redis not enabled or TAC CSV Database not set in config", redisClient=self.redisMessaging)
             self.tacData = {}
-
-        # Create individual tables if they do not exist
-        inspector = inspect(self.engine)
-        for table_name in Base.metadata.tables.keys():
-            if table_name not in inspector.get_table_names():
-                self.logTool.log(service='Database', level='debug', message=f"Creating table {table_name}", redisClient=self.redisMessaging)
-                Base.metadata.tables[table_name].create(bind=self.engine)
-            else:
-                self.logTool.log(service='Database', level='debug', message=f"Table {table_name} already exists", redisClient=self.redisMessaging)
 
     def load_IMEI_database_into_Redis(self):
         try:
@@ -1664,7 +1676,8 @@ class Database:
         elif action == "2g3g":
             # Mask first bit of AMF
             key_data['amf'] = '0' + key_data['amf'][1:]
-            vect = S6a_crypt.generate_2g3g_vector(key_data['ki'], key_data['opc'], key_data['amf'], int(key_data['sqn']), int(key_data['algo']))
+            algo = int(key_data["algo"]) if key_data["algo"] is not None else 3
+            vect = S6a_crypt.generate_2g3g_vector(key_data['ki'], key_data['opc'], key_data['amf'], int(key_data['sqn']), algo)
             vector_list = []
             self.logTool.log(service='Database', level='debug', message="Generating " + str(kwargs['requested_vectors']) + " vectors for GSM use", redisClient=self.redisMessaging)
             while kwargs['requested_vectors'] != 0:
@@ -1755,6 +1768,21 @@ class Database:
         result.pop('_sa_instance_state')
         self.safe_close(session)
         return result 
+
+    def Get_IFC_Template_by_Name(self, name):
+        """Get an IFC template by its unique name."""
+        self.logTool.log(service='Database', level='debug', message="Getting IFC Template named " + str(name), redisClient=self.redisMessaging)
+        Session = sessionmaker(bind=self.engine)
+        session = Session()    
+        try:
+            result = session.query(IFC_TEMPLATE).filter_by(name=str(name)).one()
+        except Exception as E:
+            self.safe_close(session)
+            raise ValueError(E)
+        result = result.__dict__
+        result.pop('_sa_instance_state')
+        self.safe_close(session)
+        return result
 
     def Update_AuC(self, auc_id, sqn=1, propagate=True):
         self.logTool.log(service='Database', level='debug', message=f"Updating AuC record for ID: {auc_id}", redisClient=self.redisMessaging)
