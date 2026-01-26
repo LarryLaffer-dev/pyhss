@@ -109,8 +109,18 @@ CREATE TABLE emergency_subscriber (
 	serving_pgw_timestamp VARCHAR(512),
 	PRIMARY KEY (emergency_subscriber_id)
 );
+CREATE TABLE ifc_template (
+	ifc_template_id INTEGER NOT NULL,
+	name VARCHAR(256) NOT NULL,
+	description VARCHAR(1024),
+	template_content TEXT NOT NULL,
+	last_modified VARCHAR(100),
+	PRIMARY KEY (ifc_template_id),
+	UNIQUE (name)
+);
 CREATE TABLE ims_subscriber (
 	ifc_path VARCHAR(512),
+	ifc_template_id INTEGER,
 	ims_subscriber_id INTEGER NOT NULL,
 	imsi VARCHAR(18),
 	last_modified VARCHAR(100),
@@ -129,7 +139,8 @@ CREATE TABLE ims_subscriber (
 	sh_template_path VARCHAR(512),
 	xcap_profile TEXT,
 	PRIMARY KEY (ims_subscriber_id),
-	UNIQUE (msisdn)
+	UNIQUE (msisdn),
+	FOREIGN KEY(ifc_template_id) REFERENCES ifc_template (ifc_template_id)
 );
 CREATE TABLE operation_log (
 	apn_id INTEGER,
@@ -139,6 +150,7 @@ CREATE TABLE operation_log (
 	eir_id INTEGER,
 	emergency_subscriber_id INTEGER,
 	id INTEGER NOT NULL,
+	ifc_template_id INTEGER,
 	ims_subscriber_id INTEGER,
 	imsi_imei_history_id INTEGER,
 	item_id INTEGER NOT NULL,
@@ -160,6 +172,7 @@ CREATE TABLE operation_log (
 	FOREIGN KEY(serving_apn_id) REFERENCES serving_apn (serving_apn_id),
 	FOREIGN KEY(auc_id) REFERENCES auc (auc_id),
 	FOREIGN KEY(subscriber_id) REFERENCES subscriber (subscriber_id),
+	FOREIGN KEY(ifc_template_id) REFERENCES ifc_template (ifc_template_id),
 	FOREIGN KEY(ims_subscriber_id) REFERENCES ims_subscriber (ims_subscriber_id),
 	FOREIGN KEY(roaming_rule_id) REFERENCES roaming_rule (roaming_rule_id),
 	FOREIGN KEY(roaming_network_id) REFERENCES roaming_network (roaming_network_id),
@@ -189,6 +202,7 @@ CREATE TABLE roaming_rule (
 	FOREIGN KEY(roaming_network_id) REFERENCES roaming_network (roaming_network_id) ON DELETE CASCADE
 );
 CREATE TABLE serving_apn (
+	af_subscriptions VARCHAR(1024),
 	apn INTEGER,
 	ip_version INTEGER,
 	last_modified VARCHAR(100),
