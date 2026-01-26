@@ -93,6 +93,17 @@ hss:
     bind_ip: "0.0.0.0"
     bind_port: 4222
 
+  # IFC Template Configuration
+  # Controls how Initial Filter Criteria (IFC) templates are loaded and cached
+  ifc_templates:
+    # Whether to use database-stored templates (True) or file-based templates (False)
+    # Default: False (file-based) for backward compatibility
+    use_database: False
+    # Whether to cache compiled Jinja2 templates in memory (recommended for production)
+    # Works for both database and file-based modes
+    cache_enabled: True
+    # Default template path when subscriber has no ifc_path or ifc_template_id set
+    default_template_path: 'default_ifc.xml'
 
   # Enable Zn Interface for GBA (Generic Bootstrapping Architecture)
   # Zn-Interface connects BSF (Bootstrapping Server Function) to HSS
