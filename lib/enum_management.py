@@ -413,22 +413,19 @@ class ENUMClient:
         }
         
         try:
-            # Get all IMS subscribers with pagination
-            page = 1
+            # Import IMS_SUBSCRIBER model from database module
+            from database import IMS_SUBSCRIBER
+            
+            # Get all IMS subscribers with pagination (0-based page index)
+            page = 0
             page_size = 100
             
             while True:
                 subscribers = database_client.getAllPaginated(
-                    database_client.IMS_SUBSCRIBER if hasattr(database_client, 'IMS_SUBSCRIBER') else None,
+                    IMS_SUBSCRIBER,
                     page,
                     page_size
                 )
-                
-                # Handle case where getAllPaginated returns the model class
-                # We need to import IMS_SUBSCRIBER from database module
-                from database import IMS_SUBSCRIBER
-                if subscribers is None:
-                    subscribers = database_client.getAllPaginated(IMS_SUBSCRIBER, page, page_size)
                 
                 if not subscribers or len(subscribers) == 0:
                     break
