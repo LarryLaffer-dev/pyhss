@@ -11,6 +11,7 @@ import threading
 import jinja2
 import os
 from typing import Optional, Dict, Any
+from database import IFC_TEMPLATE
 
 
 class IfcTemplateCache:
@@ -75,7 +76,7 @@ class IfcTemplateCache:
         self._log('debug', f"Template cache miss for db template {template_id}, loading from database")
         
         try:
-            template_data = database.GetObj(database.IFC_TEMPLATE, template_id)
+            template_data = database.GetObj(IFC_TEMPLATE, template_id)
             if template_data and 'template_content' in template_data:
                 template_content = template_data['template_content']
                 compiled_template = jinja2.Template(template_content)

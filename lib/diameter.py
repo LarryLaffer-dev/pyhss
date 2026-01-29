@@ -1077,7 +1077,8 @@ class Diameter:
                     peerIp = connectedPeer.IpAddress
                     peerPort = connectedPeer.Port
                 except Exception as e:
-                    pass
+                    self.logTool.log(service='HSS', level='error', message=f"[diameter.py] [sendDiameterRequest] [{requestType}] Could not get connection information for peer {hostname}: peer not found or not connected", redisClient=self.redisMessaging)
+                    return ''
 
                 try:
                     request = diameterApplication["requestMethod"](**kwargs)
