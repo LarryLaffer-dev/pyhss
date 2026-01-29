@@ -29,6 +29,7 @@ from messaging import RedisMessaging
 import json
 import socket
 import traceback
+from ast import literal_eval
 from pyhss_config import config
 
 
