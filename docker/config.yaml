@@ -205,6 +205,9 @@ influxdb:
   password: "${INFLUXDB_PASSWORD:-examplePassword}"
   database: "${INFLUXDB_DATABASE:-example}"
 
+prometheus:
+  port: ${PROMETHEUS_PORT:-9191}
+
 snmp:
   port: ${SNMP_PORT:-1161}
   listen_address: "${SNMP_LISTEN_ADDRESS:-127.0.0.1}"

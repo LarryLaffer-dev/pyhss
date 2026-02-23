@@ -138,7 +138,8 @@ def main():
         '/metrics': make_wsgi_app(registry=metricService.registry)
     })
 
-    prometheusWebClient.run(host='0.0.0.0', port=9191)
+    prometheusPort = config.get('prometheus', {}).get('port', 9191)
+    prometheusWebClient.run(host='0.0.0.0', port=prometheusPort)
 
 
 if __name__ == '__main__':

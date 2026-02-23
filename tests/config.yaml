@@ -100,6 +100,9 @@ redis:
 influxdb:
   enabled: False
 
+prometheus:
+  port: 9191
+
 snmp:
   port: 1161
   listen_address: 127.0.0.1
