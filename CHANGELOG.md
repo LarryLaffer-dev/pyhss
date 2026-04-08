@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Documentation: mid-session Gx RAR / `PUT /pcrf/` PCC rule install in `docs/PCRF_Notes.md`
 - 2G / 3G support via Osmocom GSUP.
 - Support for running PyHSS services in Docker containers and provide official Docker images.
 - Database types postgresql and sqlite.
