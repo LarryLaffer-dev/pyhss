@@ -191,3 +191,17 @@ Now we've created the Charging Rule, we can just add it to the charging_rule_lis
 In the `charging_rule_list` object wen can add additional comma separated Charging Rule IDs for other defined Charging Rules. (Setting the value to None will result in no Charging Rules being installed in the Credit Control Answer)
 
 Then when a subscriber attaches to one of these APNs, the Charging Rules listed in the `charging_rule_list` will be returned in the *Gx Credit Control Answer* and installed into the PCEF in the PGW.
+
+## Mid-session PCC rule install (Gx RAR)
+
+PyHSS can **push** an already-defined charging rule to an **active** P-GW session by sending a **Gx Re-Auth-Request (RAR)**. This is used for **policy / QoS changes only** (for example switching to a throttled rule after fair-use). Online charging (Gy) and balances are handled by the **OCS**; PyHSS does **not** implement quota metering.
+
+**REST API:** `PUT /pcrf/` with JSON body:
+
+| Field | Description |
+|-------|-------------|
+| `imsi` | Subscriber IMSI |
+| `apn_id` | Numeric APN id in PyHSS (same APN as the active session) |
+| `charging_rule_id` | Rule id from `/charging_rule/` to install |
+
+Requirements: the subscriber must have an active **serving APN** entry with a valid **PCRF session** and **serving PGW** so PyHSS can route the RAR. If there is no live session, the push will not apply as intended.
