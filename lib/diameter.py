@@ -122,6 +122,25 @@ class Diameter:
                 {"commandCode": 8388622, "applicationId": 16777291, "responseMethod": self.Answer_16777291_8388622, "failureResultCode": 4100 ,"requestAcronym": "LRR", "responseAcronym": "LRA", "requestName": "LCS Routing Info Request", "responseName": "LCS Routing Info Answer"},
             ]
 
+        # SWx Interface (Application ID: 16777265) - 3GPP AAA Server ↔ HSS (TS 29.273)
+        # Enabled by default — required for VoWiFi/ePDG authentication
+        if config.get('hss', {}).get('SWx_enabled', True):
+            self.diameterResponseList.extend([
+                {"commandCode": 303, "applicationId": 16777265,
+                 "responseMethod": self.Answer_16777265_303, "failureResultCode": 4100,
+                 "requestAcronym": "MAR", "responseAcronym": "MAA",
+                 "requestName": "Multimedia Authentication Request (SWx)",
+                 "responseName": "Multimedia Authentication Answer (SWx)"},
+                {"commandCode": 301, "applicationId": 16777265,
+                 "responseMethod": self.Answer_16777265_301, "failureResultCode": 4100,
+                 "requestAcronym": "SAR", "responseAcronym": "SAA",
+                 "requestName": "Server Assignment Request (SWx)",
+                 "responseName": "Server Assignment Answer (SWx)"},
+            ])
+            self.logTool.log(service='HSS', level='info',
+                           message="SWx Interface (VoWiFi) enabled - MAR/MAA, SAR/SAA registered",
+                           redisClient=self.redisMessaging)
+
         # Add Zh/Zn Interface commands (Application ID: 16777220) if enabled
         # Implements 3GPP TS 29.109 for GBA (Generic Bootstrapping Architecture)
         if config.get('hss', {}).get('Zn_enabled', False):
@@ -1815,6 +1834,10 @@ class Diameter:
         avp += self.generate_avp(258, 40, format(int(16777238),"x").zfill(8))                            #Auth-Application-ID - Diameter Gx
         avp += self.generate_avp(258, 40, format(int(10),"x").zfill(8))                                  #Auth-Application-ID - Diameter CER
         avp += self.generate_avp(258, 40, format(int(16777236),"x").zfill(8))                            #Auth-Application-ID - Diameter Rx
+        if config.get('hss', {}).get('SWx_enabled', True):
+            avp += self.generate_avp(265, 40, format(int(10415),"x").zfill(8))                               #Supported-Vendor-ID (3GPP)
+            avp += self.generate_avp(260, 40, "000001024000000c" + format(int(16777265),"x").zfill(8) +  "0000010a4000000c000028af")      #Vendor-Specific-Application-ID (SWx)
+            avp += self.generate_avp(258, 40, format(int(16777265),"x").zfill(8))                            #Auth-Application-ID - SWx
         avp += self.generate_avp(265, 40, format(int(5535),"x").zfill(8))                                #Supported-Vendor-ID (3GGP v2)
         avp += self.generate_avp(265, 40, format(int(10415),"x").zfill(8))                               #Supported-Vendor-ID (3GPP)
         avp += self.generate_avp(265, 40, format(int(13019),"x").zfill(8))                               #Supported-Vendor-ID 13019 (ETSI)
@@ -3540,6 +3563,171 @@ class Diameter:
         avp += self.generate_avp(282, "40", str(binascii.hexlify(b'localdomain'),'ascii'))
         
         response = self.generate_diameter_packet("01", "40", 304, 16777216, packet_vars['hop-by-hop-identifier'], packet_vars['end-to-end-identifier'], avp)     #Generate Diameter packet
+        return response
+
+    #3GPP SWx Multimedia Authentication Answer (TS 29.273)
+    #Generates EAP-AKA/AKA' authentication vectors for non-3GPP access
+    def Answer_16777265_303(self, packet_vars, avps):
+        avp = ''
+        session_id = self.get_avp_data(avps, 263)[0]
+        avp += self.generate_avp(263, 40, session_id)                                                    #Session-ID
+        avp += self.generate_avp(260, 40, "000001024000000c" + format(int(16777265),"x").zfill(8) + "0000010a4000000c000028af")   #Vendor-Specific-Application-ID (SWx)
+        avp += self.generate_avp(277, 40, "00000001")                                                    #Auth-Session-State
+        avp += self.generate_avp(264, 40, self.OriginHost)                                               #Origin-Host
+        avp += self.generate_avp(296, 40, self.OriginRealm)                                              #Origin-Realm
+
+        try:
+            username = self.get_avp_data(avps, 1)[0]
+            username = binascii.unhexlify(username).decode('utf-8')
+            self.logTool.log(service='HSS', level='debug', message="SWx MAR for user: " + str(username), redisClient=self.redisMessaging)
+
+            if '@' in username:
+                imsi = username.split('@')[0]
+                # Strip leading '0' from EAP identity NAI (0<IMSI>@nai.epc...)
+                if imsi.startswith('0'):
+                    imsi = imsi[1:]
+            else:
+                imsi = username
+
+            subscriber_details = self.database.Get_Subscriber(imsi=imsi)
+        except Exception as e:
+            self.logTool.log(service='HSS', level='debug', message="SWx MAR subscriber " + str(imsi) + " unknown: " + str(e), redisClient=self.redisMessaging)
+            self.redisMessaging.sendMetric(serviceName='diameter', metricName='prom_diam_auth_event_count',
+                                            metricType='counter', metricAction='inc', metricValue=1.0,
+                                            metricLabels={"diameter_application_id": 16777265, "diameter_cmd_code": 303, "event": "Unknown User", "imsi_prefix": str(imsi[0:6]) if imsi else ""},
+                                            metricHelp='Diameter Authentication related Counters',
+                                            metricExpiry=60, usePrefix=True, prefixHostname=self.hostname, prefixServiceName='metric')
+            experimental_result = self.generate_avp(298, 40, self.int_to_hex(5001, 4))
+            experimental_result += self.generate_vendor_avp(266, 40, 10415, "")
+            avp += self.generate_avp(297, 40, experimental_result)
+            response = self.generate_diameter_packet("01", "40", 303, 16777265, packet_vars['hop-by-hop-identifier'], packet_vars['end-to-end-identifier'], avp)
+            return response
+
+        mcc, mnc = imsi[0:3], imsi[3:5]
+        plmn = self.EncodePLMN(mcc, mnc)
+
+        # Determine number of requested auth vectors
+        num_items = 1
+        try:
+            num_items_avp = self.get_avp_data(avps, 607)
+            if num_items_avp:
+                num_items = int(num_items_avp[0], 16)
+        except:
+            pass
+
+        # Determine requested auth scheme from SIP-Auth-Data-Item (AVP 612)
+        auth_scheme = "EAP-AKA"
+        try:
+            for sub_avp_612 in self.get_avp_data(avps, 612)[0]:
+                if sub_avp_612['avp_code'] == 608:
+                    auth_scheme = binascii.unhexlify(sub_avp_612['misc_data']).decode('utf-8')
+                if sub_avp_612['avp_code'] == 610:
+                    # SQN resync
+                    auts = str(sub_avp_612['misc_data'])[32:]
+                    rand = str(sub_avp_612['misc_data'])[:32]
+                    rand = binascii.unhexlify(rand)
+                    self.database.Get_Vectors_AuC(subscriber_details['auc_id'], "sqn_resync", auts=auts, rand=rand)
+                    self.logTool.log(service='HSS', level='debug', message="SWx MAR: resynced SQN for IMSI " + str(imsi), redisClient=self.redisMessaging)
+        except:
+            pass
+
+        self.logTool.log(service='HSS', level='debug', message="SWx MAR: generating " + auth_scheme + " vectors for IMSI " + str(imsi), redisClient=self.redisMessaging)
+
+        # Generate auth vectors — SWx uses sip_auth (same as Cx) to get RAND/AUTN/XRES/CK/IK
+        vector_dict = self.database.Get_Vectors_AuC(subscriber_details['auc_id'], "sip_auth", plmn=plmn)
+
+        avp_SIP_Item_Number = self.generate_vendor_avp(613, "c0", 10415, format(int(0),"x").zfill(8))
+        avp_SIP_Authentication_Scheme = self.generate_vendor_avp(608, "c0", 10415, str(binascii.hexlify(auth_scheme.encode('utf-8')),'ascii'))
+        avp_SIP_Authenticate = self.generate_vendor_avp(609, "c0", 10415, str(binascii.hexlify(vector_dict['SIP_Authenticate']),'ascii'))
+        avp_SIP_Authorization = self.generate_vendor_avp(610, "c0", 10415, str(binascii.hexlify(vector_dict['xres']),'ascii'))
+        avp_Confidentiality_Key = self.generate_vendor_avp(625, "c0", 10415, str(binascii.hexlify(vector_dict['ck']),'ascii'))
+        avp_Integrity_Key = self.generate_vendor_avp(626, "c0", 10415, str(binascii.hexlify(vector_dict['ik']),'ascii'))
+
+        auth_data_item = avp_SIP_Item_Number + avp_SIP_Authentication_Scheme + avp_SIP_Authenticate + avp_SIP_Authorization + avp_Confidentiality_Key + avp_Integrity_Key
+        avp += self.generate_vendor_avp(612, "c0", 10415, auth_data_item)
+        avp += self.generate_vendor_avp(607, "c0", 10415, "00000001")                                    #SIP-Number-Auth-Items
+        avp += self.generate_avp(268, 40, "000007d1")                                                    #Result-Code: DIAMETER_SUCCESS
+
+        self.redisMessaging.sendMetric(serviceName='diameter', metricName='prom_diam_auth_event_count',
+                                        metricType='counter', metricAction='inc', metricValue=1.0,
+                                        metricLabels={"diameter_application_id": 16777265, "diameter_cmd_code": 303, "event": "Success", "imsi_prefix": str(imsi[0:6])},
+                                        metricHelp='Diameter Authentication related Counters',
+                                        metricExpiry=60, usePrefix=True, prefixHostname=self.hostname, prefixServiceName='metric')
+        response = self.generate_diameter_packet("01", "40", 303, 16777265, packet_vars['hop-by-hop-identifier'], packet_vars['end-to-end-identifier'], avp)
+        return response
+
+    #3GPP SWx Server Assignment Answer (TS 29.273)
+    #Handles non-3GPP access server assignment, returns Non-3GPP-User-Data
+    def Answer_16777265_301(self, packet_vars, avps):
+        avp = ''
+        session_id = self.get_avp_data(avps, 263)[0]
+        avp += self.generate_avp(263, 40, session_id)                                                    #Session-ID
+        avp += self.generate_avp(260, 40, "000001024000000c" + format(int(16777265),"x").zfill(8) + "0000010a4000000c000028af")
+        avp += self.generate_avp(277, 40, "00000001")                                                    #Auth-Session-State
+        avp += self.generate_avp(264, 40, self.OriginHost)                                               #Origin-Host
+        avp += self.generate_avp(296, 40, self.OriginRealm)                                              #Origin-Realm
+
+        try:
+            username = self.get_avp_data(avps, 1)[0]
+            username = binascii.unhexlify(username).decode('utf-8')
+            if '@' in username:
+                imsi = username.split('@')[0]
+                if imsi.startswith('0'):
+                    imsi = imsi[1:]
+            else:
+                imsi = username
+
+            subscriber_details = self.database.Get_Subscriber(imsi=imsi)
+        except:
+            self.logTool.log(service='HSS', level='debug', message="SWx SAR subscriber unknown", redisClient=self.redisMessaging)
+            experimental_result = self.generate_avp(298, 40, self.int_to_hex(5001, 4))
+            experimental_result += self.generate_vendor_avp(266, 40, 10415, "")
+            avp += self.generate_avp(297, 40, experimental_result)
+            response = self.generate_diameter_packet("01", "40", 301, 16777265, packet_vars['hop-by-hop-identifier'], packet_vars['end-to-end-identifier'], avp)
+            return response
+
+        # Server-Assignment-Type (AVP 614)
+        server_assignment_type = 0
+        try:
+            sat_avp = self.get_avp_data(avps, 614)
+            if sat_avp:
+                server_assignment_type = int(sat_avp[0], 16)
+        except:
+            pass
+
+        self.logTool.log(service='HSS', level='debug', message="SWx SAR: IMSI=" + str(imsi) + " assignment_type=" + str(server_assignment_type), redisClient=self.redisMessaging)
+
+        # Build Non-3GPP-User-Data AVP (vendor 10415, AVP 1500)
+        # Non-3GPP-IP-Access (AVP 1501): NON_3GPP_SUBSCRIPTION_ALLOWED (0)
+        non_3gpp_ip_access = self.generate_vendor_avp(1501, "c0", 10415, format(int(0),"x").zfill(8))
+        # Non-3GPP-IP-Access-APN (AVP 1502): NON_3GPP_APNS_ENABLE (0)
+        non_3gpp_ip_access_apn = self.generate_vendor_avp(1502, "c0", 10415, format(int(0),"x").zfill(8))
+        # AN-Trusted (AVP 1503): UNTRUSTED (1) — ePDG access is always untrusted
+        an_trusted = self.generate_vendor_avp(1503, "c0", 10415, format(int(1),"x").zfill(8))
+
+        # APN-Configuration (AVP 1430) for 'ims'
+        apn_context_id = self.generate_vendor_avp(1423, "c0", 10415, format(int(0),"x").zfill(8))
+        apn_service_selection = self.generate_avp(493, 40, str(binascii.hexlify(b'ims'),'ascii'))
+        apn_pdn_type = self.generate_vendor_avp(1456, "c0", 10415, format(int(0),"x").zfill(8))  # IPv4
+        apn_config = self.generate_vendor_avp(1430, "c0", 10415, apn_context_id + apn_service_selection + apn_pdn_type)
+
+        # APN-Configuration-Profile (AVP 1429)
+        apn_config_profile_context = self.generate_vendor_avp(1423, "c0", 10415, format(int(0),"x").zfill(8))
+        all_apn_config_included = self.generate_vendor_avp(1428, "c0", 10415, format(int(0),"x").zfill(8))
+        apn_config_profile = self.generate_vendor_avp(1429, "c0", 10415, apn_config_profile_context + all_apn_config_included + apn_config)
+
+        # AMBR (AVP 1435)
+        ambr_ul = self.generate_vendor_avp(516, "c0", 10415, format(int(50000000),"x").zfill(8))
+        ambr_dl = self.generate_vendor_avp(515, "c0", 10415, format(int(100000000),"x").zfill(8))
+        ambr = self.generate_vendor_avp(1435, "c0", 10415, ambr_ul + ambr_dl)
+
+        non_3gpp_user_data = self.generate_vendor_avp(1500, "c0", 10415,
+            non_3gpp_ip_access + non_3gpp_ip_access_apn + an_trusted + apn_config_profile + ambr)
+
+        avp += non_3gpp_user_data
+        avp += self.generate_avp(268, 40, "000007d1")                                                    #Result-Code: DIAMETER_SUCCESS
+
+        response = self.generate_diameter_packet("01", "40", 301, 16777265, packet_vars['hop-by-hop-identifier'], packet_vars['end-to-end-identifier'], avp)
         return response
 
     #3GPP Sh User-Data Answer
