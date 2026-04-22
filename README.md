@@ -33,6 +33,7 @@ The underlying library - ``diameter.py`` can be easily worked with to add suppor
 * Sh - For Application Servers to IMS & XCAP Data
 * Zh/Zn - For generating GBA Credentials
 * Gx Credit Control Answer / Re-Auth Request including installing Charging Rules on demand
+* SWx - 3GPP AAA Server to HSS for VoWiFi / untrusted non-3GPP access (MAR/MAA EAP-AKA & EAP-AKA', SAR/SAA, HSS-initiated PPR/RTR) — see [docs/SWx.md](docs/SWx.md)
 
 
 ## Usage

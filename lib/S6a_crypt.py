@@ -6,6 +6,7 @@ from comp128.comp128v1 import Comp128v1
 from comp128.comp128v23 import Comp128v23
 from milenage import Milenage
 import binascii
+import hmac
 import logging
 import os
 import sys
@@ -213,6 +214,56 @@ def generate_resync_s6a(key, op_c, amf, auts, rand):
     CryptoLogger.debug("Generated  sqn_ms_int: " + str(sqn_ms_int))
     CryptoLogger.debug("Generated  mac_s: " + str(mac_s))    
     return(sqn_ms_int, mac_s)
+
+def derive_eap_aka_prime_keys(ck, ik, access_network_id, sqn_xor_ak):
+    """
+    Derive CK'/IK' for EAP-AKA' per 3GPP TS 33.402 Annex A.2 and RFC 5448 §3.3.
+
+    The HSS (not the AAA server) is responsible for this derivation so that
+    the AAA server never sees the underlying CK/IK. The KDF is HMAC-SHA-256
+    with:
+
+        Key = CK | IK
+        S   = FC | P0 | L0 | P1 | L1
+        FC  = 0x20
+        P0  = Access Network Identity (per TS 24.302 §8.1.1.2, e.g. "WLAN")
+        L0  = length(P0), 2 octets network-byte-order
+        P1  = SQN XOR AK (6 octets, i.e. first 6 octets of AUTN)
+        L1  = 0x00 0x06
+
+    T = HMAC-SHA-256(Key, S) yields 32 octets; the first 16 are CK', the
+    last 16 are IK'.
+
+    Args:
+        ck (bytes): 128-bit Confidentiality Key from Milenage f3.
+        ik (bytes): 128-bit Integrity Key from Milenage f4.
+        access_network_id (bytes|str): Access Network Identity carried in
+            Access-Network-Identifier AVP (1263, vendor 10415) of the MAR.
+            A string is encoded as UTF-8.
+        sqn_xor_ak (bytes): 6-octet SQN XOR AK, i.e. AUTN[0:6].
+
+    Returns:
+        (ck_prime, ik_prime): two 16-byte values to be sent in
+        Confidentiality-Key (625) and Integrity-Key (626) AVPs when the
+        requested SIP-Authentication-Scheme is "EAP-AKA'".
+    """
+    if isinstance(access_network_id, str):
+        access_network_id = access_network_id.encode('utf-8')
+    if len(sqn_xor_ak) != 6:
+        raise ValueError("sqn_xor_ak must be 6 octets")
+
+    FC = b'\x20'
+    P0 = access_network_id
+    L0 = len(P0).to_bytes(2, 'big')
+    P1 = sqn_xor_ak
+    L1 = b'\x00\x06'
+
+    S = FC + P0 + L0 + P1 + L1
+    Key = ck + ik
+
+    T = hmac.new(Key, S, 'sha256').digest()
+    return T[:16], T[16:32]
+
 
 def generate_opc(key, op):
     #Generating OPc key from OP & K

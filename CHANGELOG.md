@@ -7,7 +7,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.6.0] - 2026-04-22
+
 ### Added
+
+- SWx interface (3GPP TS 29.273, Application-Id `16777265`) brought to
+  spec compliance for VoWiFi / untrusted non-3GPP access:
+  - EAP-AKA' CK'/IK' derivation per TS 33.402 §6.2 / RFC 5448 §3.3, driven
+    by `Access-Network-Identifier` (AVP 1263) read from MAR. New helper
+    `derive_eap_aka_prime_keys()` in `lib/S6a_crypt.py`.
+  - HSS-initiated `PPR` (Push-Profile, 305) and `RTR` (Registration-
+    Termination, 304) commands on SWx, wired into `diameterRequestList`
+    with distinct acronyms (`SWxPPR` / `SWxRTR`) to avoid the existing
+    Cx `RTR` collision.
+  - New REST endpoints `POST /push/swx/ppr/<imsi>` and
+    `POST /push/swx/rtr/<imsi>`; `POST /deregister/<imsi>` now also fans
+    a best-effort `SWxRTR` out to any connected 3GPP AAA peers.
+  - Per-subscriber SAA: `Non-3GPP-User-Data` (AVP 1500) now carries
+    repeated `APN-Configuration` (AVP 1430) entries built from
+    `database.Get_APN()` / `database.Get_SUBSCRIBER_ROUTING()` plus the
+    subscriber UE-AMBR, replacing the previous hard-coded `ims`-only
+    / 50/100 Mbps stub.
+  - `Server-Assignment-Type` (AVP 614) is now honoured: REGISTRATION /
+    RE_REGISTRATION persist the `3GPP-AAA-Server-Name` (AVP 318) against
+    the IMSI in Redis; USER_DEREGISTRATION / ADMINISTRATIVE_DEREGISTRATION
+    clear it; AAA_USER_DATA_REQUEST returns the profile without rebinding;
+    a conflicting AAA binding is rejected with
+    `DIAMETER_ERROR_IDENTITY_ALREADY_REGISTERED (5005)` including the
+    currently-bound AAA name.
+  - Centralised `_swx_parse_nai()` helper handles EAP-AKA (`0`) and
+    EAP-AKA' (`6`) NAI prefixes and the full
+    `@nai.epc.mnc<MNC>.mcc<MCC>.3gppnetwork.org` realm per TS 23.003 §19.3.2.
+  - MAA now honours `SIP-Number-Auth-Items` (AVP 607) by returning the
+    requested number of `SIP-Auth-Data-Item` groups instead of exactly one.
+  - MAR missing `SIP-Authentication-Scheme` (AVP 608) is rejected with
+    `DIAMETER_MISSING_AVP` + `Failed-AVP`, and unsupported schemes with
+    `DIAMETER_AUTHENTICATION_REJECTED`.
+- `docs/SWx.md` describing the interface, supported commands, config,
+  error handling, and current limitations. Added to README "Implemented
+  Responses" list. (pyhss `1.6.0`)
+
+### Changed
+
+- `DIAMETER_ERROR_USER_UNKNOWN (5001)` is now emitted via `Result-Code`
+  (AVP 268) on SWx (per RFC 6733 §7), not `Experimental-Result`.
+  `Experimental-Result` is reserved for SWx-specific 5xxx codes such as
+  `DIAMETER_ERROR_USER_NO_NON_3GPP_SUBSCRIPTION (5401)` and
+  `DIAMETER_ERROR_IDENTITY_ALREADY_REGISTERED (5005)`. (pyhss `1.6.0`)
+- Set the default database backend to SQLite.
+
+### Added (previously under Unreleased)
 
 - Documentation: mid-session Gx RAR / `PUT /pcrf/` PCC rule install in `docs/PCRF_Notes.md`
 - 2G / 3G support via Osmocom GSUP.
@@ -20,10 +69,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Building PyHSS with `python3 -m build` and as debian package.
 - RAT restriction checking for subscribers.
 - Automatic database upgrades (from 1.0.1 or higher).
-
-### Changed
-
-- Set the default database backend to SQLite.
 
 ### Removed
 

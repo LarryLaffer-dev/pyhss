@@ -1437,6 +1437,22 @@ class PyHSS_OAM_Deregister(Resource):
 
             databaseClient.Update_Serving_CSCF(imsi=imsi, serving_cscf=None)
 
+            # SWx Registration-Termination (TS 29.273 §8.1.2.4) — best effort.
+            # Broadcast to any connected 3GPP AAA peers so that an active
+            # VoWiFi registration is torn down in sync with this admin
+            # deregistration. Request_16777265_304 looks up the stored SWx
+            # binding via Redis; if none exists the call is a no-op.
+            try:
+                diameterClient.broadcastDiameterRequest(
+                    requestType='SWxRTR',
+                    peerType='AAA',
+                    imsi=imsi,
+                    reasonCode=0,  # PERMANENT_TERMINATION
+                    reasonInfo='Administrative Deregistration'
+                )
+            except Exception as swxErr:
+                logTool.log(service='API', level='debug', message=f"[API] [deregister] SWx RTR broadcast skipped: {swxErr}", redisClient=redisMessaging)
+
             # If a subscriber has an active serving apn, grab the pcrf session id for that apn and send a CCR-T, then a Registration Termination Request to the serving pgw peer.
             if subscriberId is not None:
                 servingApns = databaseClient.Get_Serving_APNs(subscriber_id=subscriberId)
@@ -2435,6 +2451,43 @@ class PyHSS_Push_CLR(Resource):
             print("Exception when sending CLR: " + str(E))
             response_json = {'result': 'Failed', 'Reason' : "Unable to send CLR: " + str(E)}
             return response_json
+
+
+@ns_push.route('/swx/ppr/<string:imsi>')
+class PyHSS_Push_SWx_PPR(Resource):
+    @ns_push.doc('Push SWx PPR (Push-Profile-Request) to 3GPP AAA Server (TS 29.273 §8.1.2.3)')
+    def put(self, imsi):
+        '''Push SWx PPR to the AAA server currently serving the subscriber (or broadcast to all AAAs).'''
+        try:
+            connectedPeers = diameterClient.getConnectedPeersByType(peerType='AAA')
+            if not connectedPeers:
+                return {'result': 'Failed', 'Reason': 'No connected 3GPP AAA peers'}, 404
+            diameterClient.broadcastDiameterRequest(requestType='SWxPPR', peerType='AAA', imsi=imsi)
+            return {'result': f'Successfully queued SWx PPR for IMSI {imsi}'}, 200
+        except Exception as E:
+            logTool.log(service='API', level='error', message=f"[API] [SWx PPR] Exception: {traceback.format_exc()}", redisClient=redisMessaging)
+            return {'result': 'Failed', 'Reason': f"Unable to send SWx PPR: {E}"}, 500
+
+
+@ns_push.route('/swx/rtr/<string:imsi>')
+class PyHSS_Push_SWx_RTR(Resource):
+    @ns_push.doc('Push SWx RTR (Registration-Termination-Request) to 3GPP AAA Server (TS 29.273 §8.1.2.4)')
+    def put(self, imsi):
+        '''Push SWx RTR to terminate the non-3GPP registration of the subscriber.'''
+        try:
+            connectedPeers = diameterClient.getConnectedPeersByType(peerType='AAA')
+            if not connectedPeers:
+                return {'result': 'Failed', 'Reason': 'No connected 3GPP AAA peers'}, 404
+            json_data = request.get_json(silent=True) or {}
+            reasonCode = int(json_data.get('reasonCode', 0))  # PERMANENT_TERMINATION
+            reasonInfo = json_data.get('reasonInfo', 'Administrative Deregistration')
+            diameterClient.broadcastDiameterRequest(requestType='SWxRTR', peerType='AAA',
+                                                   imsi=imsi, reasonCode=reasonCode,
+                                                   reasonInfo=reasonInfo)
+            return {'result': f'Successfully queued SWx RTR for IMSI {imsi}'}, 200
+        except Exception as E:
+            logTool.log(service='API', level='error', message=f"[API] [SWx RTR] Exception: {traceback.format_exc()}", redisClient=redisMessaging)
+            return {'result': 'Failed', 'Reason': f"Unable to send SWx RTR: {E}"}, 500
 
 
 ### IFC Template Endpoints ###
