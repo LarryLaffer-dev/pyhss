@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.6.1] - 2026-04-22
+
+### Fixed
+
+- SWx MAA (`Answer_16777265_303`) and S6a MAA paths crashed with
+  `ModuleNotFoundError: No module named 'lib'` on every EAP-AKA' /
+  EAP-AKA authentication attempt, causing the HSS to return
+  `DIAMETER_UNABLE_TO_COMPLY (5012)` to the 3GPP AAA Server. Root cause:
+  two lazy imports inside `lib/diameter.py` (`Answer_16777265_303` at
+  line 3771 and the S6a MAR handler at line 6241) used
+  `from lib.S6a_crypt import ...`, but `lib/` is on `sys.path` as a
+  search directory rather than importable as a package (no
+  `lib/__init__.py`; the Dockerfile adds `/app/lib` to `PYTHONPATH`).
+  Every other import in the same file, including the top-level
+  `from database import Database` and `from messaging import
+  RedisMessaging`, already uses the correct bare-module form. Fixed by
+  changing both call sites to `from S6a_crypt import ...` to match the
+  rest of the module's import style.
+
 ## [1.6.0] - 2026-04-22
 
 ### Added

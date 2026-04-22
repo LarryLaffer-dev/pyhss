@@ -3768,7 +3768,7 @@ class Diameter:
         self.logTool.log(service='HSS', level='debug', message=f"[diameter.py] [Answer_16777265_303] [MAA] Generating {num_items} {auth_scheme} vector(s) for IMSI {imsi} (ANID={access_network_id})", redisClient=self.redisMessaging)
 
         # Produce the requested number of SIP-Auth-Data-Item entries.
-        from lib.S6a_crypt import derive_eap_aka_prime_keys
+        from S6a_crypt import derive_eap_aka_prime_keys
         items_blob = ''
         generated = 0
         for item_index in range(num_items):
@@ -6238,7 +6238,7 @@ class Diameter:
         
         # Generate authentication vectors for GBA
         try:
-            from lib.S6a_crypt import generate_maa_vector
+            from S6a_crypt import generate_maa_vector
             
             # Get AuC data
             auc_id = subscriber_details.get('auc_id')
