@@ -3590,15 +3590,31 @@ class Diameter:
                 + "0000010a4000000c000028af")
 
     # SWx helper: parse an EAP/SWx User-Name (NAI) into the permanent IMSI per
-    # 3GPP TS 23.003 §19.3.2 and RFC 4187/5448 §4.1.1.6.
+    # 3GPP TS 23.003 §19.3.2 / TS 29.273 §8.1.2 and RFC 4187/5448 §4.1.1.6.
     #
-    # The NAI identity prefix digit indicates the identity type:
-    #   0 -> EAP-AKA permanent identity (0<IMSI>@realm)
-    #   1 -> EAP-SIM permanent identity (1<IMSI>@realm) - legacy, still mapped
-    #   6 -> EAP-AKA' permanent identity (6<IMSI>@realm)
-    #   2/3 -> pseudonym (EAP-SIM/EAP-AKA pseudonym)
-    #   4/5 -> fast re-authentication identity
-    #   7   -> EAP-AKA' pseudonym
+    # Two shapes reach the HSS:
+    #   (a) Bare IMSI NAI — "<IMSI>@nai.epc.mnc<MNC>.mcc<MCC>.3gppnetwork.org"
+    #       — sent on SWx by every compliant 3GPP AAA-Server (TS 29.273
+    #       §8.1.2.1.2 / §8.1.2.2.2) after it has stripped the EAP identity
+    #       type prefix from the AT_IDENTITY seen on the EAP layer.
+    #   (b) EAP-layer permanent identity (16 chars: 1-char prefix + 15-digit
+    #       IMSI) — only forwarded by AAAs that do not strip the prefix:
+    #         0 -> EAP-AKA permanent identity
+    #         1 -> EAP-SIM permanent identity (legacy, still mapped)
+    #         6 -> EAP-AKA' permanent identity
+    #         2/3 -> EAP-SIM/EAP-AKA pseudonym
+    #         4/5 -> fast re-authentication identity
+    #         7   -> EAP-AKA' pseudonym
+    #
+    # CRITICAL ORDERING: the bare-IMSI path MUST be matched first, because
+    # a 15-digit IMSI's leading MCC digit collides with the EAP prefix set
+    # (MCC 2xx = most of Europe, 3xx = N-America, 4xx = Asia, 5xx = Oceania,
+    # 7xx = S-America). Classifying the MCC's first digit as an EAP prefix
+    # would spuriously reject every SWx SAR/MAR for those regions with
+    # DIAMETER_ERROR_USER_UNKNOWN. IMSIs are ≤ 15 digits per TS 23.003 §2.2,
+    # and the prefixed EAP form is always exactly 16 chars, so the two
+    # shapes are unambiguous on length alone.
+    #
     # Returns a dict {imsi, prefix, realm, is_permanent}. Unknown/unsupported
     # identities raise ValueError so the caller can respond with the correct
     # Diameter error (DIAMETER_ERROR_IDENTITY_NOT_REGISTERED / USER_UNKNOWN).
@@ -3612,26 +3628,30 @@ class Diameter:
         if not userpart:
             raise ValueError("empty NAI user part")
 
-        prefix = userpart[0]
-        body = userpart[1:] if prefix in ('0', '1', '6') else userpart
+        # (a) Bare IMSI (no EAP identity-type prefix). Test FIRST — see
+        # CRITICAL ORDERING note above.
+        if userpart.isdigit() and len(userpart) <= 15:
+            return {"imsi": userpart, "prefix": '', "realm": realm,
+                    "is_permanent": True}
 
-        if prefix in ('0', '1', '6'):
-            if not body.isdigit():
-                raise ValueError(f"permanent identity with non-numeric IMSI: {userpart}")
-            return {"imsi": body, "prefix": prefix, "realm": realm, "is_permanent": True}
-
-        # Pseudonyms / fast re-auth identities (prefixes 2/3/4/5/7). A full
-        # implementation would resolve these via a pseudonym store on the
-        # HSS/AuC; we treat them as not-yet-supported rather than silently
-        # using the encoded blob as an IMSI.
-        if prefix in ('2', '3', '4', '5', '7'):
+        # (b) EAP-layer permanent/pseudonym identity: 1-char prefix +
+        # 15-digit IMSI = exactly 16 characters, all digits.
+        if userpart.isdigit() and len(userpart) == 16:
+            prefix = userpart[0]
+            body = userpart[1:]
+            if prefix in ('0', '1', '6'):
+                return {"imsi": body, "prefix": prefix, "realm": realm,
+                        "is_permanent": True}
+            # Pseudonyms / fast re-auth identities. A full implementation
+            # would resolve these via a pseudonym store on the HSS/AuC;
+            # we treat them as not-yet-supported rather than silently
+            # using the encoded blob as an IMSI.
+            if prefix in ('2', '3', '4', '5', '7'):
+                raise ValueError(
+                    f"NAI pseudonym/fast-reauth identity (prefix '{prefix}') "
+                    f"resolution is not implemented")
             raise ValueError(
-                f"NAI pseudonym/fast-reauth identity (prefix '{prefix}') "
-                f"resolution is not implemented")
-
-        # Bare IMSI (no leading digit prefix) — accept only if purely numeric.
-        if userpart.isdigit():
-            return {"imsi": userpart, "prefix": '', "realm": realm, "is_permanent": True}
+                f"unrecognised NAI identity prefix '{prefix}': {userpart}")
 
         raise ValueError(f"unrecognised NAI identity: {userpart}")
 
@@ -3952,6 +3972,15 @@ class Diameter:
             username = binascii.unhexlify(username_raw).decode('utf-8')
             nai = self._swx_parse_nai(username)
             imsi = nai['imsi']
+            # region debug log — TEMPORARY: remove after post-fix
+            # verification (session 7f72c9). Surfaces the NAI-parser
+            # classification so the next reproduction shows whether the
+            # bare-IMSI path is taken (prefix='') or the EAP-prefix
+            # path (prefix in '0'/'1'/'6') in kubectl logs.
+            self.logTool.log(service='HSS', level='info',
+                message=f"[diameter.py] [Answer_16777265_301] [SAA] [debug 7f72c9] SWx SAR NAI parsed user_name={username} imsi={imsi} prefix='{nai['prefix']}' is_permanent={nai['is_permanent']} user_part_len={len(username.split('@',1)[0])}",
+                redisClient=self.redisMessaging)
+            # endregion
             subscriber_details = self.database.Get_Subscriber(imsi=imsi)
         except Exception as e:
             self.logTool.log(service='HSS', level='info', message=f"[diameter.py] [Answer_16777265_301] [SAA] SWx SAR subscriber unknown: {e}", redisClient=self.redisMessaging)

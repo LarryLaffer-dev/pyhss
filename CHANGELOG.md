@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- SWx `_swx_parse_nai` (`lib/diameter.py`) no longer rejects bare IMSI NAIs whose first MCC digit is `2/3/4/5/7` with `DIAMETER_ERROR_USER_UNKNOWN (5001)`. The parser now matches the bare-IMSI form (TS 29.273 §8.1.2) before the 16-char EAP identity-prefix form, fixing SWx SAR/MAR for subscribers in MCCs 2xx (most of Europe), 3xx (N-America), 4xx (Asia), 5xx (Oceania) and 7xx (S-America).
+
 ## [1.6.1] - 2026-04-22
 
 ### Fixed
