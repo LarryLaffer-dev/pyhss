@@ -3972,15 +3972,6 @@ class Diameter:
             username = binascii.unhexlify(username_raw).decode('utf-8')
             nai = self._swx_parse_nai(username)
             imsi = nai['imsi']
-            # region debug log — TEMPORARY: remove after post-fix
-            # verification (session 7f72c9). Surfaces the NAI-parser
-            # classification so the next reproduction shows whether the
-            # bare-IMSI path is taken (prefix='') or the EAP-prefix
-            # path (prefix in '0'/'1'/'6') in kubectl logs.
-            self.logTool.log(service='HSS', level='info',
-                message=f"[diameter.py] [Answer_16777265_301] [SAA] [debug 7f72c9] SWx SAR NAI parsed user_name={username} imsi={imsi} prefix='{nai['prefix']}' is_permanent={nai['is_permanent']} user_part_len={len(username.split('@',1)[0])}",
-                redisClient=self.redisMessaging)
-            # endregion
             subscriber_details = self.database.Get_Subscriber(imsi=imsi)
         except Exception as e:
             self.logTool.log(service='HSS', level='info', message=f"[diameter.py] [Answer_16777265_301] [SAA] SWx SAR subscriber unknown: {e}", redisClient=self.redisMessaging)
