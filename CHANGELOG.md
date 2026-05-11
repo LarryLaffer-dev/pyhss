@@ -9,7 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Per-interface APN allowlist on `subscriber`: new `apn_list_swx` column (comma-separated APN IDs) controls which APNs are returned over SWx, separate from the existing `apn_list` used on S6a. Exposed through the REST API (auto-generated `SUBSCRIBER` schema), a new "Allowed APNs (SWx / untrusted ePDG access)" multi-select on the HSS GUI subscriber form, and a `databaseSchema` v3 upgrade that ALTERs existing databases (PyHSS `1.0.3`).
 - Documentation: mid-session Gx RAR / `PUT /pcrf/` PCC rule install in `docs/PCRF_Notes.md`
+
+### Changed
+
+- SWx Server-Assignment-Answer (`Answer_16777265_301`) now expands the subscriber's `apn_list_swx` into one `APN-Configuration` AVP per allowed APN inside `Non-3GPP-User-Data`, instead of always returning a single hardcoded `ims` APN. The top-level Non-3GPP-User-Data AMBR now reflects the subscriber's UE-AMBR (was hardcoded 50/100 Mbit/s).
+
+### Breaking
+
+- SWx Server-Assignment-Request is now rejected with Experimental-Result `DIAMETER_ERROR_USER_NO_NON_3GPP_SUBSCRIPTION (5450)` (3GPP TS 29.273 §5.2.2.4) for any subscriber whose `apn_list_swx` is NULL or empty. After upgrading, operators must populate `apn_list_swx` (typically with the IMS APN's id) on every subscriber that should be allowed VoWiFi/ePDG attach -- running the schema migration alone is not enough.
 - 2G / 3G support via Osmocom GSUP.
 - Support for running PyHSS services in Docker containers and provide official Docker images.
 - Database types postgresql and sqlite.

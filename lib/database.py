@@ -117,7 +117,8 @@ class SUBSCRIBER(Base):
     enabled = Column(Boolean, default=1, doc='Subscriber enabled/disabled')
     auc_id = Column(Integer, ForeignKey('auc.auc_id'), doc='Reference to AuC ID defined with SIM Auth data', nullable=False)
     default_apn = Column(Integer, ForeignKey('apn.apn_id'), doc='APN ID to use for the default APN', nullable=False)
-    apn_list = Column(String(64), doc='Comma separated list of allowed APNs', nullable=False)
+    apn_list = Column(String(64), doc='Comma separated list of APN IDs allowed via S6a (mobile access)', nullable=False)
+    apn_list_swx = Column(String(64), doc='Comma separated list of APN IDs allowed via SWx (untrusted access via ePDG); NULL or empty = SWx access denied (DIAMETER_ERROR_USER_NO_NON_3GPP_SUBSCRIPTION)', nullable=True, default=None)
     msisdn = Column(String(18), doc='Primary Phone number of Subscriber')
     ue_ambr_dl = Column(Integer, default=999999, doc='Downlink Aggregate Maximum Bit Rate')
     ue_ambr_ul = Column(Integer, default=999999, doc='Uplink Aggregate Maximum Bit Rate')
@@ -562,8 +563,12 @@ class Database:
         # Combine all changes into a single string with their types
         changes_string = '\r\n\r\n'.join(f"{column_name}: [{type(old_value).__name__}] {old_value} ----> [{type(new_value).__name__}] {new_value}" for column_name, old_value, new_value in changes)
 
+        # Do not use the nasty "or" expression, item_id may be 0
+        if item_id is None:
+            item_id = generated_id
+        
         change = OPERATION_LOG_BASE(
-            item_id=item_id or generated_id,
+            item_id=item_id,
             operation_id=operation_id,
             operation=operation,
             last_modified=datetime.datetime.now(tz=timezone.utc),
@@ -604,9 +609,6 @@ class Database:
                 if isinstance(obj, OPERATION_LOG_BASE):
                     continue  # Skip change log entries
 
-                item_id = getattr(obj, list(obj.__table__.primary_key.columns.keys())[0])
-                generated_id = None
-
                 #Avoid logging rollback operations
                 if operation == 'ROLLBACK':
                     return
@@ -615,6 +617,10 @@ class Database:
                 if operation == 'INSERT':
                     session.flush()
 
+                # Retrieve the attribute after session flush
+                item_id = getattr(obj, list(obj.__table__.primary_key.columns.keys())[0])
+                generated_id = None
+                
                 if operation == 'UPDATE':
                     changes = []
                     for attr in class_mapper(obj.__class__).column_attrs:

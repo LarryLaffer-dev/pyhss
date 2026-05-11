@@ -3697,7 +3697,32 @@ class Diameter:
 
         self.logTool.log(service='HSS', level='debug', message="SWx SAR: IMSI=" + str(imsi) + " assignment_type=" + str(server_assignment_type), redisClient=self.redisMessaging)
 
-        # Build Non-3GPP-User-Data AVP (vendor 10415, AVP 1500)
+        # Per-interface APN allowlist: SWx uses subscriber.apn_list_swx (separate from S6a apn_list).
+        # Per 3GPP TS 29.273 §5.2.2.4, when the subscriber has no non-3GPP subscription
+        # (no APN allowed via SWx), reject with DIAMETER_ERROR_USER_NO_NON_3GPP_SUBSCRIPTION (5450).
+        apn_list_swx_raw = subscriber_details.get('apn_list_swx') or ''
+        swx_apn_ids = [x.strip() for x in str(apn_list_swx_raw).split(',') if x.strip()]
+        if not swx_apn_ids:
+            self.logTool.log(service='HSS', level='info',
+                             message="SWx SAR: IMSI=" + str(imsi) + " has no apn_list_swx; rejecting SAA with DIAMETER_ERROR_USER_NO_NON_3GPP_SUBSCRIPTION (5450)",
+                             redisClient=self.redisMessaging)
+            experimental_result = self.generate_vendor_avp(266, 40, 10415, "")
+            experimental_result += self.generate_avp(298, 40, self.int_to_hex(5450, 4))
+            avp += self.generate_avp(297, 40, experimental_result)
+            self.redisMessaging.sendMetric(serviceName='diameter', metricName='prom_diam_auth_event_count',
+                                            metricType='counter', metricAction='inc', metricValue=1.0,
+                                            metricLabels={"diameter_application_id": 16777265, "diameter_cmd_code": 301, "event": "NoNon3gppSubscription", "imsi_prefix": str(imsi[0:6])},
+                                            metricHelp='Diameter Authentication related Counters',
+                                            metricExpiry=60, usePrefix=True, prefixHostname=self.hostname, prefixServiceName='metric')
+            response = self.generate_diameter_packet("01", "40", 301, 16777265, packet_vars['hop-by-hop-identifier'], packet_vars['end-to-end-identifier'], avp)
+            return response
+
+        # Place default_apn first if it appears in the SWx allowlist, otherwise keep declared order.
+        default_apn = subscriber_details.get('default_apn')
+        if default_apn is not None and str(default_apn) in swx_apn_ids:
+            swx_apn_ids = [str(default_apn)] + [x for x in swx_apn_ids if x != str(default_apn)]
+
+        # Build Non-3GPP-User-Data AVP (vendor 10415, AVP 1500) per TS 29.273 §8.2.3.1
         # Non-3GPP-IP-Access (AVP 1501): NON_3GPP_SUBSCRIPTION_ALLOWED (0)
         non_3gpp_ip_access = self.generate_vendor_avp(1501, "c0", 10415, format(int(0),"x").zfill(8))
         # Non-3GPP-IP-Access-APN (AVP 1502): NON_3GPP_APNS_ENABLE (0)
@@ -3705,20 +3730,51 @@ class Diameter:
         # AN-Trusted (AVP 1503): UNTRUSTED (1) — ePDG access is always untrusted
         an_trusted = self.generate_vendor_avp(1503, "c0", 10415, format(int(1),"x").zfill(8))
 
-        # APN-Configuration (AVP 1430) for 'ims'
-        apn_context_id = self.generate_vendor_avp(1423, "c0", 10415, format(int(0),"x").zfill(8))
-        apn_service_selection = self.generate_avp(493, 40, str(binascii.hexlify(b'ims'),'ascii'))
-        apn_pdn_type = self.generate_vendor_avp(1456, "c0", 10415, format(int(0),"x").zfill(8))  # IPv4
-        apn_config = self.generate_vendor_avp(1430, "c0", 10415, apn_context_id + apn_service_selection + apn_pdn_type)
+        # APN-Configuration-Profile (AVP 1429) wraps one APN-Configuration (AVP 1430) per allowed APN.
+        apn_configurations = ''
+        apn_context_identifer_count = 1
+        for apn_id in swx_apn_ids:
+            try:
+                apn_data = self.database.Get_APN(apn_id)
+            except Exception as e:
+                self.logTool.log(service='HSS', level='error',
+                                 message="SWx SAR: failed to load APN id " + str(apn_id) + ": " + str(e),
+                                 redisClient=self.redisMessaging)
+                continue
 
-        # APN-Configuration-Profile (AVP 1429)
-        apn_config_profile_context = self.generate_vendor_avp(1423, "c0", 10415, format(int(0),"x").zfill(8))
+            apn_context_id = self.generate_vendor_avp(1423, "c0", 10415, self.int_to_hex(apn_context_identifer_count, 4))
+            apn_service_selection = self.generate_avp(493, "40", self.string_to_hex(str(apn_data['apn'])))
+            apn_pdn_type = self.generate_vendor_avp(1456, "c0", 10415, self.int_to_hex(int(apn_data['ip_version']), 4))
+
+            apn_ambr_ul_avp = self.generate_vendor_avp(516, "c0", 10415, self.int_to_hex(int(apn_data['apn_ambr_ul']), 4))
+            apn_ambr_dl_avp = self.generate_vendor_avp(515, "c0", 10415, self.int_to_hex(int(apn_data['apn_ambr_dl']), 4))
+            apn_ambr = self.generate_vendor_avp(1435, "c0", 10415, apn_ambr_ul_avp + apn_ambr_dl_avp)
+
+            apn_configurations += self.generate_vendor_avp(1430, "c0", 10415,
+                apn_context_id + apn_service_selection + apn_pdn_type + apn_ambr)
+            apn_context_identifer_count += 1
+
+        if not apn_configurations:
+            self.logTool.log(service='HSS', level='error',
+                             message="SWx SAR: IMSI=" + str(imsi) + " apn_list_swx references APN ids that could not be loaded; rejecting with 5450",
+                             redisClient=self.redisMessaging)
+            experimental_result = self.generate_vendor_avp(266, 40, 10415, "")
+            experimental_result += self.generate_avp(298, 40, self.int_to_hex(5450, 4))
+            avp += self.generate_avp(297, 40, experimental_result)
+            response = self.generate_diameter_packet("01", "40", 301, 16777265, packet_vars['hop-by-hop-identifier'], packet_vars['end-to-end-identifier'], avp)
+            return response
+
+        # APN-Configuration-Profile (AVP 1429): use the first allowed APN as default Context-Identifier.
+        apn_config_profile_context = self.generate_vendor_avp(1423, "c0", 10415, self.int_to_hex(1, 4))
         all_apn_config_included = self.generate_vendor_avp(1428, "c0", 10415, format(int(0),"x").zfill(8))
-        apn_config_profile = self.generate_vendor_avp(1429, "c0", 10415, apn_config_profile_context + all_apn_config_included + apn_config)
+        apn_config_profile = self.generate_vendor_avp(1429, "c0", 10415,
+            apn_config_profile_context + all_apn_config_included + apn_configurations)
 
-        # AMBR (AVP 1435)
-        ambr_ul = self.generate_vendor_avp(516, "c0", 10415, format(int(50000000),"x").zfill(8))
-        ambr_dl = self.generate_vendor_avp(515, "c0", 10415, format(int(100000000),"x").zfill(8))
+        # Subscriber UE-AMBR (TS 29.273 keeps the same AMBR encoding as S6a; SWx and S6a should agree).
+        ue_ambr_ul = int(subscriber_details.get('ue_ambr_ul') or 0)
+        ue_ambr_dl = int(subscriber_details.get('ue_ambr_dl') or 0)
+        ambr_ul = self.generate_vendor_avp(516, "c0", 10415, self.int_to_hex(ue_ambr_ul, 4))
+        ambr_dl = self.generate_vendor_avp(515, "c0", 10415, self.int_to_hex(ue_ambr_dl, 4))
         ambr = self.generate_vendor_avp(1435, "c0", 10415, ambr_ul + ambr_dl)
 
         non_3gpp_user_data = self.generate_vendor_avp(1500, "c0", 10415,
@@ -3727,6 +3783,11 @@ class Diameter:
         avp += non_3gpp_user_data
         avp += self.generate_avp(268, 40, "000007d1")                                                    #Result-Code: DIAMETER_SUCCESS
 
+        self.redisMessaging.sendMetric(serviceName='diameter', metricName='prom_diam_auth_event_count',
+                                        metricType='counter', metricAction='inc', metricValue=1.0,
+                                        metricLabels={"diameter_application_id": 16777265, "diameter_cmd_code": 301, "event": "Success", "imsi_prefix": str(imsi[0:6])},
+                                        metricHelp='Diameter Authentication related Counters',
+                                        metricExpiry=60, usePrefix=True, prefixHostname=self.hostname, prefixServiceName='metric')
         response = self.generate_diameter_packet("01", "40", 301, 16777265, packet_vars['hop-by-hop-identifier'], packet_vars['end-to-end-identifier'], avp)
         return response
 
