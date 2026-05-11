@@ -7,81 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Fixed
-
-- SWx `_swx_parse_nai` (`lib/diameter.py`) no longer rejects bare IMSI NAIs whose first MCC digit is `2/3/4/5/7` with `DIAMETER_ERROR_USER_UNKNOWN (5001)`. The parser now matches the bare-IMSI form (TS 29.273 §8.1.2) before the 16-char EAP identity-prefix form, fixing SWx SAR/MAR for subscribers in MCCs 2xx (most of Europe), 3xx (N-America), 4xx (Asia), 5xx (Oceania) and 7xx (S-America).
-
-## [1.6.1] - 2026-04-22
-
-### Fixed
-
-- SWx MAA (`Answer_16777265_303`) and S6a MAA paths crashed with
-  `ModuleNotFoundError: No module named 'lib'` on every EAP-AKA' /
-  EAP-AKA authentication attempt, causing the HSS to return
-  `DIAMETER_UNABLE_TO_COMPLY (5012)` to the 3GPP AAA Server. Root cause:
-  two lazy imports inside `lib/diameter.py` (`Answer_16777265_303` at
-  line 3771 and the S6a MAR handler at line 6241) used
-  `from lib.S6a_crypt import ...`, but `lib/` is on `sys.path` as a
-  search directory rather than importable as a package (no
-  `lib/__init__.py`; the Dockerfile adds `/app/lib` to `PYTHONPATH`).
-  Every other import in the same file, including the top-level
-  `from database import Database` and `from messaging import
-  RedisMessaging`, already uses the correct bare-module form. Fixed by
-  changing both call sites to `from S6a_crypt import ...` to match the
-  rest of the module's import style.
-
-## [1.6.0] - 2026-04-22
-
 ### Added
 
-- SWx interface (3GPP TS 29.273, Application-Id `16777265`) brought to
-  spec compliance for VoWiFi / untrusted non-3GPP access:
-  - EAP-AKA' CK'/IK' derivation per TS 33.402 §6.2 / RFC 5448 §3.3, driven
-    by `Access-Network-Identifier` (AVP 1263) read from MAR. New helper
-    `derive_eap_aka_prime_keys()` in `lib/S6a_crypt.py`.
-  - HSS-initiated `PPR` (Push-Profile, 305) and `RTR` (Registration-
-    Termination, 304) commands on SWx, wired into `diameterRequestList`
-    with distinct acronyms (`SWxPPR` / `SWxRTR`) to avoid the existing
-    Cx `RTR` collision.
-  - New REST endpoints `POST /push/swx/ppr/<imsi>` and
-    `POST /push/swx/rtr/<imsi>`; `POST /deregister/<imsi>` now also fans
-    a best-effort `SWxRTR` out to any connected 3GPP AAA peers.
-  - Per-subscriber SAA: `Non-3GPP-User-Data` (AVP 1500) now carries
-    repeated `APN-Configuration` (AVP 1430) entries built from
-    `database.Get_APN()` / `database.Get_SUBSCRIBER_ROUTING()` plus the
-    subscriber UE-AMBR, replacing the previous hard-coded `ims`-only
-    / 50/100 Mbps stub.
-  - `Server-Assignment-Type` (AVP 614) is now honoured: REGISTRATION /
-    RE_REGISTRATION persist the `3GPP-AAA-Server-Name` (AVP 318) against
-    the IMSI in Redis; USER_DEREGISTRATION / ADMINISTRATIVE_DEREGISTRATION
-    clear it; AAA_USER_DATA_REQUEST returns the profile without rebinding;
-    a conflicting AAA binding is rejected with
-    `DIAMETER_ERROR_IDENTITY_ALREADY_REGISTERED (5005)` including the
-    currently-bound AAA name.
-  - Centralised `_swx_parse_nai()` helper handles EAP-AKA (`0`) and
-    EAP-AKA' (`6`) NAI prefixes and the full
-    `@nai.epc.mnc<MNC>.mcc<MCC>.3gppnetwork.org` realm per TS 23.003 §19.3.2.
-  - MAA now honours `SIP-Number-Auth-Items` (AVP 607) by returning the
-    requested number of `SIP-Auth-Data-Item` groups instead of exactly one.
-  - MAR missing `SIP-Authentication-Scheme` (AVP 608) is rejected with
-    `DIAMETER_MISSING_AVP` + `Failed-AVP`, and unsupported schemes with
-    `DIAMETER_AUTHENTICATION_REJECTED`.
-- `docs/SWx.md` describing the interface, supported commands, config,
-  error handling, and current limitations. Added to README "Implemented
-  Responses" list. (pyhss `1.6.0`)
+- Per-interface APN allowlist on `subscriber`: new `apn_list_swx` column (comma-separated APN IDs) controls which APNs are returned over SWx, separate from the existing `apn_list` used on S6a. Exposed through the REST API (auto-generated `SUBSCRIBER` schema), a new "Allowed APNs (SWx / untrusted ePDG access)" multi-select on the HSS GUI subscriber form, and a `databaseSchema` v3 upgrade that ALTERs existing databases (PyHSS `1.0.3`).
+- Documentation: mid-session Gx RAR / `PUT /pcrf/` PCC rule install in `docs/PCRF_Notes.md`
 
 ### Changed
 
-- `DIAMETER_ERROR_USER_UNKNOWN (5001)` is now emitted via `Result-Code`
-  (AVP 268) on SWx (per RFC 6733 §7), not `Experimental-Result`.
-  `Experimental-Result` is reserved for SWx-specific 5xxx codes such as
-  `DIAMETER_ERROR_USER_NO_NON_3GPP_SUBSCRIPTION (5401)` and
-  `DIAMETER_ERROR_IDENTITY_ALREADY_REGISTERED (5005)`. (pyhss `1.6.0`)
-- Set the default database backend to SQLite.
+- SWx Server-Assignment-Answer (`Answer_16777265_301`) now expands the subscriber's `apn_list_swx` into one `APN-Configuration` AVP per allowed APN inside `Non-3GPP-User-Data`, instead of always returning a single hardcoded `ims` APN. The top-level Non-3GPP-User-Data AMBR now reflects the subscriber's UE-AMBR (was hardcoded 50/100 Mbit/s).
 
-### Added (previously under Unreleased)
+### Breaking
 
-- Documentation: mid-session Gx RAR / `PUT /pcrf/` PCC rule install in `docs/PCRF_Notes.md`
+- SWx Server-Assignment-Request is now rejected with Experimental-Result `DIAMETER_ERROR_USER_NO_NON_3GPP_SUBSCRIPTION (5450)` (3GPP TS 29.273 §5.2.2.4) for any subscriber whose `apn_list_swx` is NULL or empty. After upgrading, operators must populate `apn_list_swx` (typically with the IMS APN's id) on every subscriber that should be allowed VoWiFi/ePDG attach -- running the schema migration alone is not enough.
 - 2G / 3G support via Osmocom GSUP.
 - Support for running PyHSS services in Docker containers and provide official Docker images.
 - Database types postgresql and sqlite.
@@ -92,6 +29,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Building PyHSS with `python3 -m build` and as debian package.
 - RAT restriction checking for subscribers.
 - Automatic database upgrades (from 1.0.1 or higher).
+
+### Changed
+
+- Set the default database backend to SQLite.
 
 ### Removed
 
