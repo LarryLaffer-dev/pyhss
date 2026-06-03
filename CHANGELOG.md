@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Sh UDR/UDA per-Data-Reference dispatch (TS 29.328/29.329): the HSS now parses Data-Reference, Service-Indication, Requested-Domain, and Current-Location AVPs from inbound UDR and returns only the requested data. Supported Data-Reference values: RepositoryData (0), IMSPublicIdentity (10), IMSUserState (11), S-CSCFName (12), LocationInformation (14), MSISDN (17), TADSinformation (26), STN-SR (27), UE-SRVCC-Capability (28).
+- Sh UDR subscriber lookup now supports `tel:` Public-Identity URIs alongside `sip:` URIs.
+- New `ims_subscriber` columns: `stn_sr` (Session Transfer Number for SRVCC) and `ue_srvcc_capability` (UE SRVCC Capability), with `databaseSchema` v4 upgrade.
+- T-ADS Information assembly from live subscriber state (VoiceOverPS session support, CS/PS domain registration, SRVCC capability, last UE activity time) for SCC-AS queries.
+- Legacy Jinja2 template fallback: UDR without Data-Reference AVPs still renders the full `default_sh_user_data.xml` template for backward compatibility.
+- Fixed legacy template bug where `repository_data` was set to empty string instead of `None`, preventing the default MMTEL-Services block from rendering.
 - Per-interface APN allowlist on `subscriber`: new `apn_list_swx` column (comma-separated APN IDs) controls which APNs are returned over SWx, separate from the existing `apn_list` used on S6a. Exposed through the REST API (auto-generated `SUBSCRIBER` schema), a new "Allowed APNs (SWx / untrusted ePDG access)" multi-select on the HSS GUI subscriber form, and a `databaseSchema` v3 upgrade that ALTERs existing databases (PyHSS `1.0.3`).
 - Documentation: mid-session Gx RAR / `PUT /pcrf/` PCC rule install in `docs/PCRF_Notes.md`
 
