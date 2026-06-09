@@ -102,6 +102,16 @@ hss:
     # Default template path when ifc_path/ifc_template_id is not set
     default_template_path: "${HSS_IFC_TEMPLATES_DEFAULT_TEMPLATE_PATH:-default_ifc.xml}"
 
+  # Zh Interface (GBA) -- 3GPP TS 29.109 §6 / App-Id 16777221. Enables the
+  # BSF<->HSS GBA Multimedia-Authentication (MAR/MAA) handler and Zh CEA
+  # advertisement. Boolean (unquoted) so YAML parses it as a real bool.
+  Zn_enabled: ${ZN_ENABLED:-False}
+  bsf:
+    # BSF FQDN used by the HSS only for B-TID logging; the BSF itself mints the
+    # authoritative B-TID. Match the BSF's Diameter Origin-Host when set.
+    bsf_hostname: "${BSF_HOSTNAME:-bsf.mnc001.mcc001.3gppnetwork.org}"
+    gaa_key_lifetime: ${GAA_KEY_LIFETIME:-3600}
+
 api:
   page_size: ${API_PAGE_SIZE:-200}
   # Whether or not to return key-based data when querying the AUC. Disable in production systems.

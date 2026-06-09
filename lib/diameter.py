@@ -141,15 +141,17 @@ class Diameter:
                            message="SWx Interface (VoWiFi) enabled - MAR/MAA, SAR/SAA registered",
                            redisClient=self.redisMessaging)
 
-        # Add Zh/Zn Interface commands (Application ID: 16777220) if enabled
-        # Implements 3GPP TS 29.109 for GBA (Generic Bootstrapping Architecture)
+        # Add Zh Interface commands (Application ID: 16777221) if enabled.
+        # Zh (BSF <-> HSS) per 3GPP TS 29.109 §6 / IANA App-Id 16777221 carries
+        # the GBA MAR/MAA. (Zn = 16777220 is the NAF <-> BSF interface, handled
+        # by the BSF itself, not the HSS.)
         if config.get('hss', {}).get('Zn_enabled', False):
             self.diameterResponseList.append(
-                {"commandCode": 303, "applicationId": 16777220, 
-                 "responseMethod": self.Answer_16777220_303, "failureResultCode": 5001,
+                {"commandCode": 303, "applicationId": 16777221, 
+                 "responseMethod": self.Answer_16777221_303, "failureResultCode": 5001,
                  "requestAcronym": "MAR", "responseAcronym": "MAA", 
-                 "requestName": "Multimedia Authentication Request (Zn)", 
-                 "responseName": "Multimedia Authentication Answer (Zn)"}
+                 "requestName": "Multimedia Authentication Request (Zh)", 
+                 "responseName": "Multimedia Authentication Answer (Zh)"}
             )
             self.logTool.log(service='HSS', level='info', 
                            message="Zn-Interface (GBA) enabled - MAR/MAA command registered",
@@ -179,8 +181,10 @@ class Diameter:
         Initialize Zn-Interface specific components
         """
         try:
-            # Import Zn-Interface module
-            from lib.zn_interface import ZnInterface
+            # Import Zn-Interface module. Modules live flat on sys.path
+            # (/app/lib), so import by bare name -- a "lib." prefix raises
+            # ModuleNotFoundError at runtime.
+            from zn_interface import ZnInterface
             
             self.zn_interface = ZnInterface(self, self.database, self.config)
             
@@ -1838,6 +1842,10 @@ class Diameter:
             avp += self.generate_avp(265, 40, format(int(10415),"x").zfill(8))                               #Supported-Vendor-ID (3GPP)
             avp += self.generate_avp(260, 40, "000001024000000c" + format(int(16777265),"x").zfill(8) +  "0000010a4000000c000028af")      #Vendor-Specific-Application-ID (SWx)
             avp += self.generate_avp(258, 40, format(int(16777265),"x").zfill(8))                            #Auth-Application-ID - SWx
+        if config.get('hss', {}).get('Zn_enabled', False):
+            avp += self.generate_avp(265, 40, format(int(10415),"x").zfill(8))                               #Supported-Vendor-ID (3GPP)
+            avp += self.generate_avp(260, 40, "000001024000000c" + format(int(16777221),"x").zfill(8) +  "0000010a4000000c000028af")      #Vendor-Specific-Application-ID (Zh GBA)
+            avp += self.generate_avp(258, 40, format(int(16777221),"x").zfill(8))                            #Auth-Application-ID - Zh (GBA)
         avp += self.generate_avp(265, 40, format(int(5535),"x").zfill(8))                                #Supported-Vendor-ID (3GGP v2)
         avp += self.generate_avp(265, 40, format(int(10415),"x").zfill(8))                               #Supported-Vendor-ID (3GPP)
         avp += self.generate_avp(265, 40, format(int(13019),"x").zfill(8))                               #Supported-Vendor-ID 13019 (ETSI)
@@ -5975,10 +5983,10 @@ class Diameter:
     # ============================================================================
     # ZN-INTERFACE SPECIFIC METHODS
     # ============================================================================
-    def Answer_16777220_303(self, packet_vars, avps):
+    def Answer_16777221_303(self, packet_vars, avps):
         """
-        3GPP Zh/Zn Multimedia Authentication Answer (MAA) for GBA
-        Implements 3GPP TS 29.109
+        3GPP Zh Multimedia Authentication Answer (MAA) for GBA
+        Implements 3GPP TS 29.109 §6 (Zh, App-Id 16777221)
         
         This method handles MAR requests from BSF for GBA bootstrapping.
         
@@ -6029,15 +6037,15 @@ class Diameter:
                             redisClient=self.redisMessaging)
             return self.Respond_ResultCode(packet_vars, avps, 5001)
         
-        # Extract Public-Identity (IMPU)
+        # Extract Public-Identity (IMPU) -- OPTIONAL on Zh. GBA bootstrapping is
+        # IMPI-based (TS 29.109 §6.3 / TS 33.220), so the BSF MAR does not carry
+        # a Public-Identity. Only echo it back if the peer supplied one.
+        public_identity = None
         try:
             public_identity_avp = self.get_avp_data(avps, 601)[0]
             public_identity = binascii.unhexlify(public_identity_avp).decode('utf-8')
-        except Exception as e:
-            self.logTool.log(service='HSS', level='error', 
-                            message=f"Failed to extract public identity: {str(e)}",
-                            redisClient=self.redisMessaging)
-            return self.Respond_ResultCode(packet_vars, avps, 5001)
+        except Exception:
+            public_identity = None
         
         # Get subscriber details from database
         try:
@@ -6055,9 +6063,9 @@ class Diameter:
                     metricAction='inc',
                     metricValue=1.0,
                     metricLabels={
-                        "diameter_application_id": 16777220,
-                        "diameter_cmd_code": 303,
-                        "event": "Unknown_Subscriber",
+                "diameter_application_id": 16777221,
+                "diameter_cmd_code": 303,
+                "event": "Unknown_Subscriber",
                         "imsi_prefix": str(imsi[0:6])
                     },
                     metricHelp='Diameter GBA Authentication Counters',
@@ -6087,52 +6095,49 @@ class Diameter:
         except:
             pass  # Use default if not specified
         
-        # Generate PLMN
-        plmn = self.generate_plmn(subscriber_details.get('msisdn', ''))
+        # Generate PLMN (TS 23.003) from the IMSI, matching the Cx/S6a MAA path
+        # (see Answer_16777216_303). generate_maa_vector expects the encoded
+        # hex PLMN string produced by EncodePLMN, not an MSISDN.
+        mcc, mnc = imsi[0:3], imsi[3:5]
+        plmn = self.EncodePLMN(mcc, mnc)
         
-        # Generate authentication vectors for GBA
+        # Generate authentication vectors for GBA via the shared AuC helper.
+        # Get_Vectors_AuC(action="sip_auth") mirrors the Cx SIP MAA path: it
+        # runs Milenage and returns SIP-Authenticate (RAND||AUTN), XRES, CK and
+        # IK, and increments the stored SQN. (The previous manual Get_AuC /
+        # generate_maa_vector path called Get_AuC with the wrong signature --
+        # Get_AuC takes keyword args only -- which raised at runtime.)
         try:
-            from lib.S6a_crypt import generate_maa_vector
-            
-            # Get AuC data
             auc_id = subscriber_details.get('auc_id')
-            auc = self.database.Get_AuC(auc_id)
-            
-            if auc is None:
-                self.logTool.log(service='HSS', level='error', 
-                                message=f"No AuC data for subscriber: {imsi}",
+            if auc_id is None:
+                self.logTool.log(service='HSS', level='error',
+                                message=f"No AuC associated with subscriber: {imsi}",
                                 redisClient=self.redisMessaging)
                 return self.Respond_ResultCode(packet_vars, avps, 4181)
-            
-            # Increment and update SQN
-            sqn = int(auc['sqn'])
-            sqn += 1
-            self.database.Update_AuC(auc_id, sqn=sqn)
-            
-            # Generate MAA vector
-            (rand, autn, xres, ck, ik) = generate_maa_vector(
-                auc['ki'],
-                auc['opc'],
-                auc['amf'],
-                sqn,
-                plmn
-            )
-            
-            self.logTool.log(service='HSS', level='debug', 
+
+            vectors = self.database.Get_Vectors_AuC(auc_id, "sip_auth", plmn=plmn)
+            sip_authenticate = vectors['SIP_Authenticate']   # RAND || AUTN
+            rand = sip_authenticate[:16]
+            autn = sip_authenticate[16:]
+            xres = vectors['xres']
+            ck = vectors['ck']
+            ik = vectors['ik']
+
+            self.logTool.log(service='HSS', level='debug',
                             message="Successfully generated GBA authentication vector",
                             redisClient=self.redisMessaging)
-            
         except Exception as e:
-            self.logTool.log(service='HSS', level='error', 
+            self.logTool.log(service='HSS', level='error',
                             message=f"Failed to generate auth vector: {str(e)}",
                             redisClient=self.redisMessaging)
             return self.Respond_ResultCode(packet_vars, avps, 4181)
         
         # Build MAA response AVPs
         
-        # Public-Identity
-        avp += self.generate_vendor_avp(601, "c0", 10415, 
-                                       str(binascii.hexlify(str.encode(public_identity)), 'ascii'))
+        # Public-Identity (only echoed when the MAR carried one)
+        if public_identity:
+            avp += self.generate_vendor_avp(601, "c0", 10415, 
+                                           str(binascii.hexlify(str.encode(public_identity)), 'ascii'))
         
         # User-Name
         avp += self.generate_avp(1, 40, 
@@ -6184,9 +6189,11 @@ class Diameter:
         # AVP 277: Auth-Session-State (NO_STATE_MAINTAINED = 1)
         avp += self.generate_avp(277, 40, "00000001")
         
-        # AVP 260: Vendor-Specific-Application-Id for Zh/Zn
-        # Vendor-Id: 10415 (3GPP), Auth-Application-Id: 16777220 (Zh/Zn)
-        avp += self.generate_avp(260, 40, "0000010a4000000c000028af000001024000000c010055d4")
+        # AVP 260: Vendor-Specific-Application-Id for Zh
+        # Vendor-Id: 10415 (3GPP), Auth-Application-Id: 16777221 (Zh)
+        avp += self.generate_avp(260, 40,
+                                 self.generate_vendor_avp(266, 40, 10415, '')
+                                 + self.generate_avp(258, 40, format(int(16777221), "x").zfill(8)))
         
         # Generate B-TID for logging (optional)
         if self.zn_enabled and hasattr(self, 'zn_interface'):
@@ -6206,7 +6213,7 @@ class Diameter:
             metricAction='inc',
             metricValue=1.0,
             metricLabels={
-                "diameter_application_id": 16777220,
+                "diameter_application_id": 16777221,
                 "diameter_cmd_code": 303,
                 "event": "Successful_GBA_Auth",
                 "imsi_prefix": str(imsi[0:6])
@@ -6223,7 +6230,7 @@ class Diameter:
             "01",  # Version
             "40",  # Flags (Response bit set)
             303,   # Command Code
-            16777220,  # Application ID (Zh/Zn)
+            16777221,  # Application ID (Zh)
             packet_vars['hop-by-hop-identifier'],
             packet_vars['end-to-end-identifier'],
             avp

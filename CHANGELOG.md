@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- GBA Zh interface end-to-end (3GPP TS 29.109 §6): the GBA Multimedia-Authentication (MAR/MAA) handler now registers on the **Zh** Application-Id `16777221` (was the Zn id `16777220`), advertises Zh in the CER/CEA capabilities (gated by `hss.Zn_enabled`), and echoes `16777221` in the MAA Application-Id and `Vendor-Specific-Application-Id`. `Public-Identity` (AVP 601) is now optional on the Zh MAR (GBA is IMPI-based; the BSF does not send an IMPU), so the BSF's MAR is answered with a real Milenage vector instead of being rejected with `DIAMETER_MISSING_AVP`. New `config.yaml` keys `hss.Zn_enabled` and `hss.bsf.{bsf_hostname,gaa_key_lifetime}` (env `ZN_ENABLED`, `BSF_HOSTNAME`, `GAA_KEY_LIFETIME`) wire the handler on (image `hss:1.6.5`).
+
+### Fixed
+
+- The GBA MAA `Vendor-Specific-Application-Id` AVP previously encoded a malformed Auth-Application-Id (`0x010055d4`); it is now built from the correct Zh id (`16777221`).
+
 - Sh UDR/UDA per-Data-Reference dispatch (TS 29.328/29.329): the HSS now parses Data-Reference, Service-Indication, Requested-Domain, and Current-Location AVPs from inbound UDR and returns only the requested data. Supported Data-Reference values: RepositoryData (0), IMSPublicIdentity (10), IMSUserState (11), S-CSCFName (12), LocationInformation (14), MSISDN (17), TADSinformation (26), STN-SR (27), UE-SRVCC-Capability (28).
 - Sh UDR subscriber lookup now supports `tel:` Public-Identity URIs alongside `sip:` URIs.
 - New `ims_subscriber` columns: `stn_sr` (Session Transfer Number for SRVCC) and `ue_srvcc_capability` (UE SRVCC Capability), with `databaseSchema` v4 upgrade.

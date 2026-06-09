@@ -11,7 +11,9 @@ This module provides helper functions for:
 - Ks_NAF key derivation
 - NAF authorization validation
 
-The Diameter MAR/MAA handler is implemented in lib/diameter.py (Answer_16777220_303)
+The Diameter MAR/MAA handler is implemented in lib/diameter.py (Answer_16777221_303,
+3GPP TS 29.109 §6 Zh, App-Id 16777221). Note: Zn (16777220) is the NAF<->BSF
+interface; the BSF<->HSS GBA interface is Zh (16777221).
 """
 
 import hashlib
