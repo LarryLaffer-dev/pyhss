@@ -9,10 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- ENUM NAPTR replacement URIs are now generated as `sip:+<E.164>@<domain>` so ENUM results match the registered `+E.164` IMPUs (image `hss:1.6.7`).
 - GBA Zh interface end-to-end (3GPP TS 29.109 §6): the GBA Multimedia-Authentication (MAR/MAA) handler now registers on the **Zh** Application-Id `16777221` (was the Zn id `16777220`), advertises Zh in the CER/CEA capabilities (gated by `hss.Zn_enabled`), and echoes `16777221` in the MAA Application-Id and `Vendor-Specific-Application-Id`. `Public-Identity` (AVP 601) is now optional on the Zh MAR (GBA is IMPI-based; the BSF does not send an IMPU), so the BSF's MAR is answered with a real Milenage vector instead of being rejected with `DIAMETER_MISSING_AVP`. New `config.yaml` keys `hss.Zn_enabled` and `hss.bsf.{bsf_hostname,gaa_key_lifetime}` (env `ZN_ENABLED`, `BSF_HOSTNAME`, `GAA_KEY_LIFETIME`) wire the handler on (image `hss:1.6.5`).
 
 ### Fixed
 
+- Fixed swapped `MCC` / `MNC` placeholders in the Docker image `config.yaml`, which produced reversed IMS home network domains (e.g. `ims.mnc262.mcc024...` instead of `ims.mnc024.mcc262...`) in iFC/Sh rendering (image `hss:1.6.7`).
 - The GBA MAA `Vendor-Specific-Application-Id` AVP previously encoded a malformed Auth-Application-Id (`0x010055d4`); it is now built from the correct Zh id (`16777221`).
 
 - Sh UDR/UDA per-Data-Reference dispatch (TS 29.328/29.329): the HSS now parses Data-Reference, Service-Indication, Requested-Domain, and Current-Location AVPs from inbound UDR and returns only the requested data. Supported Data-Reference values: RepositoryData (0), IMSPublicIdentity (10), IMSUserState (11), S-CSCFName (12), LocationInformation (14), MSISDN (17), TADSinformation (26), STN-SR (27), UE-SRVCC-Capability (28).
@@ -26,10 +28,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `default_ifc.xml` and `default_sh_user_data.xml` now render MSISDN public identities as global E.164 with leading `+` (`sip:+<msisdn>@<domain>`, `tel:+<msisdn>`). This fixes terminating VoWiFi calls failing with 404 at the IPSec gateway because the dialed `tel:+E164` To URI did not match the registration's P-Associated-URI aliases stored without `+` (image `hss:1.6.7`).
+- `Get_IMS_Subscriber_Details_from_AVP` now classifies identities with a leading `+` as MSISDN before applying the 15/16-digit IMSI length heuristic.
 - SWx Server-Assignment-Answer (`Answer_16777265_301`) now expands the subscriber's `apn_list_swx` into one `APN-Configuration` AVP per allowed APN inside `Non-3GPP-User-Data`, instead of always returning a single hardcoded `ims` APN. The top-level Non-3GPP-User-Data AMBR now reflects the subscriber's UE-AMBR (was hardcoded 50/100 Mbit/s).
 
 ### Breaking
 
+- The REST API now rejects subscriber / ims_subscriber MSISDNs that are not global E.164 numbers with a leading `+` (e.g. `+4915888456043`) with HTTP 400. Storage remains digits-only; `GET .../msisdn/<msisdn>` lookups accept both forms (image `hss:1.6.7`).
 - SWx Server-Assignment-Request is now rejected with Experimental-Result `DIAMETER_ERROR_USER_NO_NON_3GPP_SUBSCRIPTION (5450)` (3GPP TS 29.273 §5.2.2.4) for any subscriber whose `apn_list_swx` is NULL or empty. After upgrading, operators must populate `apn_list_swx` (typically with the IMS APN's id) on every subscriber that should be allowed VoWiFi/ePDG attach -- running the schema migration alone is not enough.
 - 2G / 3G support via Osmocom GSUP.
 - Support for running PyHSS services in Docker containers and provide official Docker images.
