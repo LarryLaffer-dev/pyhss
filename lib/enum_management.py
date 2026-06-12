@@ -10,7 +10,7 @@ RFC 6116 when IMS subscribers are provisioned.
 Example ENUM mapping:
   MSISDN: +491721234567
   DNS Name: 7.6.5.4.3.2.1.7.2.9.4.e164.arpa
-  NAPTR Record: 10 10 "u" "E2U+sip" "!^.*$!sip:491721234567@ims.mnc001.mcc001.3gppnetwork.org!" .
+  NAPTR Record: 10 10 "u" "E2U+sip" "!^.*$!sip:+491721234567@ims.mnc001.mcc001.3gppnetwork.org!" .
 """
 
 import requests
@@ -98,10 +98,12 @@ class ENUMClient:
         clean_msisdn = ''.join(filter(str.isdigit, msisdn))
         
         # Format: order preference "flags" "service" "regexp" replacement
-        # Example: 10 10 "u" "E2U+sip" "!^.*$!sip:491721234567@ims.example.com!" .
+        # Example: 10 10 "u" "E2U+sip" "!^.*$!sip:+491721234567@ims.example.com!" .
+        # The replacement URI carries the global E.164 number with leading '+'
+        # so it matches the +E.164 IMPUs registered at the S-CSCF.
         return (
             f'{self.naptr_order} {self.naptr_preference} "u" "E2U+sip" '
-            f'"!^.*$!sip:{clean_msisdn}@{sip_domain}!" .'
+            f'"!^.*$!sip:+{clean_msisdn}@{sip_domain}!" .'
         )
 
     def _parse_msisdn_list(self, msisdn: Optional[str], msisdn_list: Optional[str]) -> List[str]:
