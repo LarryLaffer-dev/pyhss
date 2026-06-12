@@ -9,11 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Sh Subscribe-Notifications (SNR/SNA, command 308, TS 29.328 §6.1.3): Application Servers can subscribe to (and unsubscribe from) repository-data changes per subscriber and Service-Indication; subscriptions are stored in Redis (shared, unprefixed `sh_subscriptions:<id>` keys) and the SNA attaches the current User-Data when Send-Data-Indication is present (image `hss:1.7.0`).
+- Sh Push-Notification (PNR/PNA, command 309, TS 29.328 §6.1.4): on REST PATCH of an `ims_subscriber` that changes `xcap_profile` / `sh_profile`, the API sends a PNR with the updated `<Sh-Data>` (User-Data AVP 702) to every subscribed AS (image `hss:1.7.0`).
+- New `POST /geored/sh_profile_updated` endpoint and `hss.sh_notify_endpoints` config key (env `SH_NOTIFY_ENDPOINTS`): in split provisioning/Diameter deployments the provisioning API relays profile changes to the Diameter nodes, which send PNRs for the subscriptions they hold; endpoint hostnames are resolved to all A/AAAA records so one headless-service URL fans out to every node (image `hss:1.7.0`).
+
 - ENUM NAPTR replacement URIs are now generated as `sip:+<E.164>@<domain>` so ENUM results match the registered `+E.164` IMPUs (image `hss:1.6.7`).
 - GBA Zh interface end-to-end (3GPP TS 29.109 §6): the GBA Multimedia-Authentication (MAR/MAA) handler now registers on the **Zh** Application-Id `16777221` (was the Zn id `16777220`), advertises Zh in the CER/CEA capabilities (gated by `hss.Zn_enabled`), and echoes `16777221` in the MAA Application-Id and `Vendor-Specific-Application-Id`. `Public-Identity` (AVP 601) is now optional on the Zh MAR (GBA is IMPI-based; the BSF does not send an IMPU), so the BSF's MAR is answered with a real Milenage vector instead of being rejected with `DIAMETER_MISSING_AVP`. New `config.yaml` keys `hss.Zn_enabled` and `hss.bsf.{bsf_hostname,gaa_key_lifetime}` (env `ZN_ENABLED`, `BSF_HOSTNAME`, `GAA_KEY_LIFETIME`) wire the handler on (image `hss:1.6.5`).
 
 ### Fixed
 
+- The Diameter library now prefixes the shared Redis keys (`diameterPeers`, `diameter-inbound`, `diameter-outbound-*`) with the configured Diameter Origin-Host instead of the OS hostname, matching diameterService/hssService. This fixes API-initiated Diameter requests (PNR, CLR, RTR, ...) silently failing to find peers or queue messages whenever the container hostname differs from the Origin-Host (image `hss:1.7.0`).
 - Fixed swapped `MCC` / `MNC` placeholders in the Docker image `config.yaml`, which produced reversed IMS home network domains (e.g. `ims.mnc262.mcc024...` instead of `ims.mnc024.mcc262...`) in iFC/Sh rendering (image `hss:1.6.7`).
 - The GBA MAA `Vendor-Specific-Application-Id` AVP previously encoded a malformed Auth-Application-Id (`0x010055d4`); it is now built from the correct Zh id (`16777221`).
 
