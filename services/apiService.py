@@ -118,7 +118,7 @@ def send_pnr_for_local_subscriptions(ims_subscriber_data):
             subscription = {}
         service_indications = subscription.get('serviceIndications') or [None]
         user_data = diameterClient.sh_build_notification_user_data(ims_subscriber_data, service_indications[0])
-        diameterClient.sendDiameterRequest(
+        sent = diameterClient.sendDiameterRequest(
             requestType='PNR',
             hostname=origin_host,
             destinationHost=origin_host,
@@ -127,7 +127,10 @@ def send_pnr_for_local_subscriptions(ims_subscriber_data):
             publicIdentity=public_identity,
             userData=user_data,
         )
-        logTool.log(service='API', level='info', message=f"[API] Sent Sh PNR to {origin_host} for ims_subscriber {ims_subscriber_id}", redisClient=redisMessaging)
+        if sent:
+            logTool.log(service='API', level='info', message=f"[API] Sent Sh PNR to {origin_host} for ims_subscriber {ims_subscriber_id}", redisClient=redisMessaging)
+        else:
+            logTool.log(service='API', level='warning', message=f"[API] Sh PNR to {origin_host} for ims_subscriber {ims_subscriber_id} was not sent: AS peer not connected and no DRA route available", redisClient=redisMessaging)
 
 
 def relay_sh_profile_update(ims_subscriber_data):
