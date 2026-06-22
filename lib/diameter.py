@@ -27,6 +27,7 @@ import xml.etree.ElementTree as ET
 from pyhss_config import config
 from rat import SubscriberRATRestriction, RAT
 from ast import literal_eval
+from urllib.parse import urlparse
 
 class Diameter:
 
@@ -2537,49 +2538,84 @@ class Diameter:
         self.logTool.log(service='HSS', level='debug', message="Successfully Generated NOA", redisClient=self.redisMessaging)
         return response
 
-    # Upon receipt of CCR-Type 3 (Termination), lookup AF Subscriptions and send according Rx-STR-Requests to the Subscriber 
+    # Upon receipt of CCR-Type 3 (Termination), send Rx ASR to every AF subscribed
+    # to the IMS signalling bearer. The Gx session and the Rx subscription may be
+    # handled by different cluster nodes (each diameter node has its own node-local
+    # Redis and its own Diameter peer links), so we terminate the subscriptions
+    # held locally and relay the trigger to the other nodes; the node that holds a
+    # subscription is also the one with the Diameter link to that AF.
     def GxCCR3_to_RxSTR(self, imsi, apn):
-        self.logTool.log(service='HSS', level='debug', message=f"[diameter.py] [GxCCR3_to_RxSTR] [CCA] Attempting to find APN in CCR", redisClient=self.redisMessaging)
-        self.logTool.log(service='HSS', level='debug', message=f"[diameter.py] [GxCCR3_to_RxSTR] [CCA] CCR for APN " + str(apn), redisClient=self.redisMessaging)
-        self.logTool.log(service='HSS', level='debug', message=f"[diameter.py] [GxCCR3_to_RxSTR] [CCA] Got local IMSI: {imsi}", redisClient=self.redisMessaging)
+        self.rx_terminate_local_af_subscriptions(imsi, apn)
+        self.rx_relay_terminate(imsi, apn)
+        return True
+
+    def rx_terminate_local_af_subscriptions(self, imsi, apn):
+        """Send an Rx ASR (TS 29.214) to every AF whose signalling-bearer
+        subscription for this subscriber/APN is stored in this node's Redis, then
+        drop the subscription. Idempotent: a subscription lives on exactly one
+        node, so a relayed self-call simply finds nothing left to do."""
+        self.logTool.log(service='HSS', level='debug', message=f"[diameter.py] [GxCCR3_to_RxSTR] CCR-T for APN {apn}, IMSI {imsi}", redisClient=self.redisMessaging)
         subscriberDetails = self.database.Get_Subscriber(imsi=imsi)
         if not subscriberDetails:
             self.logTool.log(service='HSS', level='debug', message=f"[diameter.py] [GxCCR3_to_RxSTR] No Subscriber found for IMSI", redisClient=self.redisMessaging)
             return True
-        else:
-            SubscriberID = subscriberDetails['subscriber_id']
-            self.logTool.log(service='HSS', level='debug', message=f"[diameter.py] [GxCCR3_to_RxSTR] Got Subscriber ID: {SubscriberID}", redisClient=self.redisMessaging)
+        SubscriberID = subscriberDetails['subscriber_id']
+        self.logTool.log(service='HSS', level='debug', message=f"[diameter.py] [GxCCR3_to_RxSTR] Got Subscriber ID: {SubscriberID}", redisClient=self.redisMessaging)
 
-            apnId = (self.database.Get_APN_by_Name(apn=apn)).get('apn_id', None)
-            if apnId is None:
-                self.logTool.log(service='HSS', level='debug', message=f"[diameter.py] [GxCCR3_to_RxSTR] No APN found for APN {apn}", redisClient=self.redisMessaging)
-                return True
+        storedApn = self.database.Get_APN_by_Name(apn=apn)
+        apnId = storedApn.get('apn_id', None) if storedApn else None
+        if apnId is None:
+            self.logTool.log(service='HSS', level='debug', message=f"[diameter.py] [GxCCR3_to_RxSTR] No APN found for APN {apn}", redisClient=self.redisMessaging)
+            return True
 
-            # Get Serving APN for this subscriber / APN
-            ServingAPN = self.database.Get_Serving_APN(subscriber_id=SubscriberID, apn_id=apnId)
-            if not ServingAPN:
-                self.logTool.log(service='HSS', level='debug', message=f"[diameter.py] [GxCCR3_to_RxSTR] No Serving APN found for Subscriber ID {SubscriberID}", redisClient=self.redisMessaging)
-                return True
-            else:
-                self.logTool.log(service='HSS', level='debug', message=f"[diameter.py] [GxCCR3_to_RxSTR] Got Serving APN: {ServingAPN}", redisClient=self.redisMessaging)
-                if ServingAPN['af_subscriptions'] is None:
-                    self.logTool.log(service='HSS', level='debug', message=f"[diameter.py] [GxCCR3_to_RxSTR] No AF Subscription found for Subscriber ID {SubscriberID}", redisClient=self.redisMessaging)
-                    return True
-                else:
-                    # Send Rx-STR-Request to the AF
-                    AFSubscription = literal_eval(ServingAPN['af_subscriptions'])
-                    self.logTool.log(service='HSS', level='debug', message=f"[diameter.py] [GxCCR3_to_RxSTR] Got AF Subscription: {AFSubscription}", redisClient=self.redisMessaging)
-                    for af in AFSubscription:
-                        self.logTool.log(service='HSS', level='debug', message=f"[diameter.py] [GxCCR3_to_RxSTR] Sending Rx-STR-Request to AF {af['af_peer']}", redisClient=self.redisMessaging)
-                        self.sendDiameterRequest(
-                            requestType='ASR',
-                            hostname=af['af_peer'],
-                            peer=af['af_peer'],
-                            realm=af['af_realm'],
-                            sessionId=af['af_session_id'],
-                            abortCause=1
-                        )
-                    return True
+        AFSubscription = self.rx_get_af_subscriptions(SubscriberID, apnId)
+        if not AFSubscription:
+            self.logTool.log(service='HSS', level='debug', message=f"[diameter.py] [GxCCR3_to_RxSTR] No local AF Subscription for Subscriber ID {SubscriberID}", redisClient=self.redisMessaging)
+            return True
+
+        # Send Rx-ASR-Request to each subscribed AF and drop the subscription.
+        self.logTool.log(service='HSS', level='debug', message=f"[diameter.py] [GxCCR3_to_RxSTR] Got AF Subscription: {AFSubscription}", redisClient=self.redisMessaging)
+        for af_session_id, af in AFSubscription.items():
+            self.logTool.log(service='HSS', level='debug', message=f"[diameter.py] [GxCCR3_to_RxSTR] Sending Rx-ASR-Request to AF {af['af_peer']}", redisClient=self.redisMessaging)
+            self.sendDiameterRequest(
+                requestType='ASR',
+                hostname=af['af_peer'],
+                peer=af['af_peer'],
+                realm=af['af_realm'],
+                sessionId=af_session_id,
+                abortCause=1
+            )
+            self.rx_remove_af_subscription(subscriber_id=SubscriberID, apn_id=apnId, af_session_id=af_session_id)
+        return True
+
+    def rx_relay_terminate(self, imsi, apn):
+        """Relay a Gx CCR-T termination to the other PyHSS Diameter nodes so the
+        node that holds the Rx AF subscription (and the Diameter link to that AF)
+        sends the Rx ASR. Mirrors the Sh sh_notify relay: each endpoint hostname
+        is resolved to all A/AAAA records so a single headless-service URL fans out
+        to every node, and nodes without a matching subscription no-op."""
+        endpoints = config.get('hss', {}).get('rx_notify_endpoints', []) or []
+        if not endpoints:
+            return
+        for endpoint in endpoints:
+            parsed = urlparse(endpoint)
+            host = parsed.hostname
+            port = parsed.port or 8080
+            if not host:
+                continue
+            try:
+                addresses = sorted({addrinfo[4][0] for addrinfo in socket.getaddrinfo(host, port, proto=socket.IPPROTO_TCP)})
+            except Exception as e:
+                self.logTool.log(service='HSS', level='warning', message=f"[diameter.py] [rx_relay_terminate] failed to resolve {host}: {e}", redisClient=self.redisMessaging)
+                continue
+            for address in addresses:
+                urlHost = f"[{address}]" if ':' in address else address
+                url = f"{parsed.scheme}://{urlHost}:{port}/geored/rx_terminate_af_subscriptions"
+                try:
+                    requests.post(url, json={'imsi': imsi, 'apn': apn}, timeout=2)
+                    self.logTool.log(service='HSS', level='debug', message=f"[diameter.py] [rx_relay_terminate] sent to {url} for IMSI {imsi} APN {apn}", redisClient=self.redisMessaging)
+                except Exception as e:
+                    self.logTool.log(service='HSS', level='warning', message=f"[diameter.py] [rx_relay_terminate] relay to {url} failed: {e}", redisClient=self.redisMessaging)
 
 
     #3GPP Gx Credit Control Answer
@@ -4458,6 +4494,40 @@ class Diameter:
     ####        3GPP RX         ####
     ################################ 
 
+    def _rx_af_subscription_key(self, subscriber_id, apn_id):
+        # Node-local Rx state: written on AAR, read on Gx CCR-T / Rx STR.
+        # Mirrors sh_subscriptions:<id>.
+        return f"af_subscriptions:{subscriber_id}:{apn_id}"
+
+    def rx_store_af_subscription(self, subscriber_id, apn_id, af_session_id, af_peer, af_realm, af_session_expires):
+        """Record an AF's Rx subscription to the IMS signalling bearer (TS 29.214)."""
+        expires_at = int(time.time()) + int(af_session_expires)
+        value = json.dumps({"af_peer": af_peer, "af_realm": af_realm, "af_session_expires": expires_at})
+        self.redisMessaging.setHashValue(name=self._rx_af_subscription_key(subscriber_id, apn_id),
+                                         key=af_session_id, value=value)
+
+    def rx_remove_af_subscription(self, subscriber_id, apn_id, af_session_id):
+        self.redisMessaging.deleteHashKey(name=self._rx_af_subscription_key(subscriber_id, apn_id),
+                                          key=af_session_id)
+        return True
+
+    def rx_get_af_subscriptions(self, subscriber_id, apn_id):
+        """Return {af_session_id: {af_peer, af_realm, af_session_expires}}, pruning expired entries."""
+        name = self._rx_af_subscription_key(subscriber_id, apn_id)
+        subscriptions = self.redisMessaging.getAllHashData(name=name)
+        if not isinstance(subscriptions, dict):
+            return {}
+        now = int(time.time())
+        active = {}
+        for af_session_id, data in subscriptions.items():
+            if not isinstance(data, dict):
+                continue
+            if data.get('af_session_expires', 0) < now:
+                self.redisMessaging.deleteHashKey(name=name, key=af_session_id)
+                continue
+            active[af_session_id] = data
+        return active
+
     #3GPP Rx - AA Answer (AAA)
     def Answer_16777236_265(self, packet_vars, avps):
         try:
@@ -4645,7 +4715,7 @@ class Diameter:
                             self.logTool.log(service='HSS', level='debug', message=f"[diameter.py] [Answer_16777236_265] [AAA] ApnID: {apnId}", redisClient=self.redisMessaging)
 
                         self.logTool.log(service='HSS', level='info', message=f"[diameter.py] [Answer_16777236_265] [AAA] Media Type is Control (IMSI {imsi} / SubscriberId {subscriberId} / APNid {apnId}), setting timeout to {timeout}", redisClient=self.redisMessaging)
-                        self.database.Add_AF_Subscription(subscriber_id=subscriberId, imsi=imsi, apn_id=apnId, af_session_id=aarSessionID, af_peer=aarOriginHost, af_realm=aarOriginRealm, af_session_expires=timeout)
+                        self.rx_store_af_subscription(subscriber_id=subscriberId, apn_id=apnId, af_session_id=aarSessionID, af_peer=aarOriginHost, af_realm=aarOriginRealm, af_session_expires=timeout)
                         avp += self.generate_avp(268, 40, self.int_to_hex(2001, 4))
                         response = self.generate_diameter_packet("01", "40", 265, 16777236, packet_vars['hop-by-hop-identifier'], packet_vars['end-to-end-identifier'], avp)     #Generate Diameter packet
                         return response
@@ -5032,7 +5102,7 @@ class Diameter:
                 subscriber = self.database.Get_Subscriber(imsi=imsi)
                 subscriberId = subscriber.get('subscriber_id', None)
                 apnId = (self.database.Get_APN_by_Name(apn="ims")).get('apn_id', None)
-                if self.database.Rem_AF_Subscription(imsi=imsi, subscriber_id=subscriberId, apn_id=apnId, af_session_id=sessionId):
+                if self.rx_remove_af_subscription(subscriber_id=subscriberId, apn_id=apnId, af_session_id=sessionId):
                     self.logTool.log(service='HSS', level='debug', message=f"[diameter.py] [Answer_16777236_275] [STA] Removed AF Subscription for subscriber: {subscriberId}", redisClient=self.redisMessaging)
                 servingApn = self.database.Get_Serving_APN(subscriber_id=subscriberId, apn_id=apnId)
                 try:

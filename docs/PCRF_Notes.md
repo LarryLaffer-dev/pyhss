@@ -205,3 +205,18 @@ PyHSS can **push** an already-defined charging rule to an **active** P-GW sessio
 | `charging_rule_id` | Rule id from `/charging_rule/` to install |
 
 Requirements: the subscriber must have an active **serving APN** entry with a valid **PCRF session** and **serving PGW** so PyHSS can route the RAR. If there is no live session, the push will not apply as intended.
+
+## Rx AF (signalling bearer) subscriptions
+
+When a P-CSCF (acting as the Rx AF) sends an **Rx AAR** for the IMS signalling bearer (`Media-Type` = Control, TS 29.214), PyHSS records the AF session so it can later notify the AF — by sending an **Rx ASR** to each subscribed AF when the corresponding **Gx CCR-T** tears the session down.
+
+These subscriptions are stored in **Redis** (not in the database), in a per-subscriber/APN hash `af_subscriptions:<subscriber_id>:<apn_id>`, with the **Rx Session-Id** as the field and `{af_peer, af_realm, af_session_expires}` as the value. The store mirrors the Sh `sh_subscriptions:<id>` store: it is node-local and self-cleaning (expired entries are pruned on read, and an Rx STR removes its entry). The legacy `serving_apn.af_subscriptions` column is retained for backward compatibility but is no longer read or written.
+
+### Cross-node termination (active/active deployments)
+
+Because the store is **node-local**, the node that received the Rx AAR (and therefore holds the AF subscription and the Diameter link to that AF) is often **not** the node that receives the matching **Gx CCR-T** — the P-CSCF and the P-GW connect to the cluster independently. The Gx CCR-T handler ([`GxCCR3_to_RxSTR`](../lib/diameter.py)) therefore:
+
+1. Terminates any subscriptions held in **this** node's Redis (`rx_terminate_local_af_subscriptions`): for each, it sends the Rx ASR and drops the entry.
+2. Relays the termination (`rx_relay_terminate`) to the other Diameter nodes via `POST /geored/rx_terminate_af_subscriptions` with `{imsi, apn}`. Each peer runs the same node-local terminate, so the node that actually holds the subscription sends the ASR over **its own** link to the AF.
+
+The relay targets are configured with `hss.rx_notify_endpoints` (env `RX_NOTIFY_ENDPOINTS`); each hostname is resolved to **all** A/AAAA records, so a single Kubernetes headless-service URL (`<release>-hss-diameter-headless:8080`) fans out to every node. A node without a matching subscription is a no-op, and because each subscription lives on exactly one node and is removed once aborted, the relayed self-call never produces a duplicate ASR. This mirrors the Sh `sh_notify_endpoints` / `POST /geored/sh_profile_updated` relay.
