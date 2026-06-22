@@ -4545,7 +4545,7 @@ class Diameter:
 
             subscriptionId = bytes.fromhex(self.get_avp_data(avps, 444)[0]).decode('ascii')
             self.logTool.log(service='HSS', level='debug', message=f"[diameter.py] [Answer_16777236_265] [AAA] Received subscription ID: {subscriptionId}", redisClient=self.redisMessaging)
-            subscriptionId = subscriptionId.replace('sip:', '')
+            subscriptionId = subscriptionId.replace('sip:', '').replace('tel:', '')
             imsi = None
             msisdn = None
             identifier = None
@@ -4620,6 +4620,10 @@ class Diameter:
 
             if '@' in subscriptionId:
                 subscriberIdentifier = subscriptionId.split('@')[0]
+                # A leading '+' denotes a global E.164 MSISDN; strip it so the value
+                # matches the MSISDN stored in the database without the '+'.
+                if subscriberIdentifier.startswith('+'):
+                    subscriberIdentifier = subscriberIdentifier[1:]
                 # Subscriber Identifier can be either an IMSI or an MSISDN
                 try:
                     subscriberDetails = self.database.Get_Subscriber(imsi=subscriberIdentifier)
@@ -5033,12 +5037,16 @@ class Diameter:
             avp += self.generate_avp(296, 40, self.OriginRealm)                                              #Origin Realm
             subscriptionId = bytes.fromhex(self.get_avp_data(avps, 444)[0]).decode('ascii')
             self.logTool.log(service='HSS', level='debug', message=f"[diameter.py] [Answer_16777236_258] [RAA] Received subscription ID: {subscriptionId}", redisClient=self.redisMessaging)
-            subscriptionId = subscriptionId.replace('sip:', '')
+            subscriptionId = subscriptionId.replace('sip:', '').replace('tel:', '')
             imsi = None
             msisdn = None
             identifier = None
             if '@' in subscriptionId:
                 subscriberIdentifier = subscriptionId.split('@')[0]
+                # A leading '+' denotes a global E.164 MSISDN; strip it so the value
+                # matches the MSISDN stored in the database without the '+'.
+                if subscriberIdentifier.startswith('+'):
+                    subscriberIdentifier = subscriberIdentifier[1:]
                 # Subscriber Identifier can be either an IMSI or an MSISDN
                 try:
                     subscriberDetails = self.database.Get_Subscriber(imsi=subscriberIdentifier)
