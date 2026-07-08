@@ -198,7 +198,8 @@ class Diameter:
             # ModuleNotFoundError at runtime.
             from zn_interface import ZnInterface
             
-            self.zn_interface = ZnInterface(self, self.database, self.config)
+            self.zn_interface = ZnInterface(self, self.database, config)
+            self.zn_enabled = True
             
             self.logTool.log(service='HSS', level='info', 
                            message="Zn-Interface initialized successfully",
