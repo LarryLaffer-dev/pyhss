@@ -4787,7 +4787,12 @@ class Diameter:
                             qci = 1
                             precedence = 40
                             arp_priority = 14
-                            rule_name = "GBR-Voice_" + str(aarSessionID)
+                            # Open5GS binds dedicated bearers by PCC rule name, so a per-call name
+                            # adds a new bearer every call and leaks until the per-session cap of 4
+                            # (Bearer Overflow). Use a stable per-subscriber name so the single
+                            # QCI-1 voice bearer is reused/updated; fall back to the Rx session id
+                            # only when subscriberId is unavailable (e.g. emergency).
+                            rule_name = "GBR-Voice_" + str(subscriberId if subscriberId else aarSessionID)
                             charging_rule_id = 1000
                         elif (int(mediaType, 16) == 4):
                             #Video
@@ -4796,7 +4801,7 @@ class Diameter:
                             qci = 1
                             precedence = 30
                             arp_priority = 11
-                            rule_name = "GBR-Video_" + str(aarSessionID)
+                            rule_name = "GBR-Video_" + str(subscriberId if subscriberId else aarSessionID)
                             charging_rule_id = 1001
 
                         try:
@@ -5102,6 +5107,7 @@ class Diameter:
             avp += self.generate_avp(264, 40, self.OriginHost)                                               #Origin Host
             avp += self.generate_avp(296, 40, self.OriginRealm)                                              #Origin Realm
             servingApn = None
+            subscriberId = None
             try:
                 imsSubscriber = self.database.Get_IMS_Subscriber_By_Session_Id(sessionId=sessionId)
                 imsi = imsSubscriber.get('imsi', None)
@@ -5175,7 +5181,7 @@ class Diameter:
                         sessionId=pcrfSessionId,
                         servingPgw=servingPgw,
                         servingRealm=servingPgwRealm,
-                        chargingRuleName='GBR-Voice_' + str(aarSessionID),
+                        chargingRuleName='GBR-Voice_' + str(subscriberId if subscriberId else aarSessionID),
                         chargingRuleAction='remove'
                 )
             
