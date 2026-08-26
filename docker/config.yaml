@@ -112,6 +112,21 @@ hss:
     bsf_hostname: "${BSF_HOSTNAME:-bsf.mnc001.mcc001.3gppnetwork.org}"
     gaa_key_lifetime: ${GAA_KEY_LIFETIME:-3600}
 
+  # Overlaid from SH_NOTIFY_ENDPOINTS / RX_NOTIFY_ENDPOINTS (space-separated URLs)
+  sh_notify_endpoints: []
+  rx_notify_endpoints: []
+
+# Geographic redundancy. Helm ENABLE_GEO_REDUNDANCY / SYNC_ENDPOINTS overlay
+# geored.enabled and geored.endpoints after this template is envsubst'd.
+geored:
+  enabled: ${GEORED_ENABLED:-False}
+  sync_actions:
+    - "HSS"
+    - "IMS"
+    - "PCRF"
+    - "EIR"
+  endpoints: []
+
 api:
   page_size: ${API_PAGE_SIZE:-200}
   # Whether or not to return key-based data when querying the AUC. Disable in production systems.

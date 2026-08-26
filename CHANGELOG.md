@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Sh PUR (command 307) now writes `xcap_profile` (and clears the deprecated `sh_profile` column) and georeds `{imsi, xcap_profile}` to peer APIs, including the provisioning master, so Ut/XCAP edits and a master backup see the same repository data. `PATCH /geored/` accepts `xcap_profile` and PNRs local SNR subscriptions without looping through `sh_notify_endpoints`. Helm env vars `ENABLE_GEO_REDUNDANCY`, `SYNC_ENDPOINTS`, `SH_NOTIFY_ENDPOINTS`, and `RX_NOTIFY_ENDPOINTS` overlay `config.yaml` after load (image `hss:1.7.6`).
+
 - Sh Subscribe-Notifications (SNR/SNA, command 308, TS 29.328 §6.1.3): Application Servers can subscribe to (and unsubscribe from) repository-data changes per subscriber and Service-Indication; subscriptions are stored in Redis (shared, unprefixed `sh_subscriptions:<id>` keys) and the SNA attaches the current User-Data when Send-Data-Indication is present (image `hss:1.7.0`).
 - Sh Push-Notification (PNR/PNA, command 309, TS 29.328 §6.1.4): on REST PATCH of an `ims_subscriber` that changes `xcap_profile` / `sh_profile`, the API sends a PNR with the updated `<Sh-Data>` (User-Data AVP 702) to every subscribed AS (image `hss:1.7.0`).
 - New `POST /geored/sh_profile_updated` endpoint and `hss.sh_notify_endpoints` config key (env `SH_NOTIFY_ENDPOINTS`): in split provisioning/Diameter deployments the provisioning API relays profile changes to the Diameter nodes, which send PNRs for the subscriptions they hold; endpoint hostnames are resolved to all A/AAAA records so one headless-service URL fans out to every node (image `hss:1.7.0`).
@@ -40,6 +42,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `default_ifc.xml` and `default_sh_user_data.xml` now render MSISDN public identities as global E.164 with leading `+` (`sip:+<msisdn>@<domain>`, `tel:+<msisdn>`). This fixes terminating VoWiFi calls failing with 404 at the IPSec gateway because the dialed `tel:+E164` To URI did not match the registration's P-Associated-URI aliases stored without `+` (image `hss:1.6.7`).
 - `Get_IMS_Subscriber_Details_from_AVP` now classifies identities with a leading `+` as MSISDN before applying the 15/16-digit IMSI length heuristic.
 - SWx Server-Assignment-Answer (`Answer_16777265_301`) now expands the subscriber's `apn_list_swx` into one `APN-Configuration` AVP per allowed APN inside `Non-3GPP-User-Data`, instead of always returning a single hardcoded `ims` APN. The top-level Non-3GPP-User-Data AMBR now reflects the subscriber's UE-AMBR (was hardcoded 50/100 Mbit/s).
+- Sh PUR now stores repository data in `xcap_profile` (clearing `sh_profile`) instead of the deprecated `sh_profile` column, matching the GUI services editor (image `hss:1.7.6`).
 
 ### Breaking
 

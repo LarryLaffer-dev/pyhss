@@ -4290,60 +4290,40 @@ class Diameter:
         VendorSpecificApplicationId += self.generate_avp(258, 40, format(int(16777217),"x").zfill(8))   #Auth-Application-ID Sh
         avp += self.generate_avp(260, 40, VendorSpecificApplicationId) 
         try:
-            #Get IMSI
-            imsi = self.get_avp_data(avps, 1)[0]                                                        #Get IMSI from User-Name AVP in request
+            # Optional User-Name (IMSI) — not sent by MMTel Ut PUR
+            imsi = self.get_avp_data(avps, 1)[0]
             imsi = binascii.unhexlify(imsi).decode('utf-8')
-            #Start with the Current User Data
             subscriber_ims_details = self.database.Get_IMS_Subscriber(imsi=imsi)
-        except:
+        except Exception:
+            subscriber_ims_details = None
+
+        if not subscriber_ims_details:
             try:
-                user_identity_avp = self.get_avp_data(avps, 700)[0]
-                
-                #Try to get MSISDN
-                try:
-                    msisdn = self.get_avp_data(user_identity_avp, 701)[0]                                                         #Get MSISDN from AVP in request
-                    self.logTool.log(service='HSS', level='debug', message="Got raw MSISDN with value " + str(msisdn), redisClient=self.redisMessaging)
-                    msisdn = self.TBCD_decode(msisdn)
-                    self.logTool.log(service='HSS', level='debug', message="Got MSISDN with value " + str(msisdn), redisClient=self.redisMessaging)            
-                    subscriber_ims_details = self.database.Get_IMS_Subscriber(msisdn=msisdn)
-                except:
-                #Try to get the IMSI from the Public Identity
-                    public_identity = self.get_avp_data(avps, 601)[0]
-                    public_identity = binascii.unhexlify(public_identity).decode('utf-8')
-                    self.logTool.log(service='HSS', level='debug', message="Got public_identity : " + str(public_identity), redisClient=self.redisMessaging)
-                    if "sip:" in public_identity:
-                        public_identity = public_identity.replace("sip:", "")
-                    
-                    if "@" in public_identity:
-                        imsi = public_identity.split('@')[0]   #Strip Domain
-                    
-                    if len(public_identity) == 15:
-                        self.logTool.log(service='HSS', level='debug', message="Got IMSI: " + str(imsi), redisClient=self.redisMessaging)                                                              
-                        subscriber_ims_details = self.database.Get_IMS_Subscriber(imsi=imsi)
-                    else:
-                        msisdn = imsi
-                        self.logTool.log(service='HSS', level='debug', message="Got msisdn (from public identity): " + str(msisdn), redisClient=self.redisMessaging)
-                        subscriber_ims_details = self.database.Get_IMS_Subscriber(msisdn=msisdn)
-            except:
-                self.logTool.log(service='HSS', level='debug', message="No User Identity present - This request is invalid", redisClient=self.redisMessaging)
-                result_code = 5001
-                #Experimental Result AVP
-                avp_experimental_result = ''
-                avp_experimental_result += self.generate_vendor_avp(266, 40, 10415, '')                         #AVP Vendor ID
-                avp_experimental_result += self.generate_avp(298, 40, self.int_to_hex(result_code, 4))          #AVP Experimental-Result-Code
-                avp += self.generate_avp(297, 40, avp_experimental_result)                                      #AVP Experimental-Result(297)
-                response = self.generate_diameter_packet("01", "40", 306, 16777217, packet_vars['hop-by-hop-identifier'], packet_vars['end-to-end-identifier'], avp)     #Generate Diameter packet
-                return response
+                _epc, subscriber_ims_details = self._sh_resolve_subscriber(avps)
+            except Exception:
+                subscriber_ims_details = None
+
+        if not subscriber_ims_details:
+            self.logTool.log(service='HSS', level='debug', message="No User Identity present - This request is invalid", redisClient=self.redisMessaging)
+            result_code = 5001
+            #Experimental Result AVP
+            avp_experimental_result = ''
+            avp_experimental_result += self.generate_vendor_avp(266, 40, 10415, '')                         #AVP Vendor ID
+            avp_experimental_result += self.generate_avp(298, 40, self.int_to_hex(result_code, 4))          #AVP Experimental-Result-Code
+            avp += self.generate_avp(297, 40, avp_experimental_result)                                      #AVP Experimental-Result(297)
+            response = self.generate_diameter_packet("01", "40", 306, 16777217, packet_vars['hop-by-hop-identifier'], packet_vars['end-to-end-identifier'], avp)     #Generate Diameter packet
+            return response
 
         #Get Sh User Data
         sh_user_data = self.get_avp_data(avps, 702)[0]                                                        #Get IMSI from User-Name AVP in request
         sh_user_data = binascii.unhexlify(sh_user_data).decode('utf-8')
         self.logTool.log(service='HSS', level='debug', message="Got Sh User data: " + str(sh_user_data), redisClient=self.redisMessaging)
 
-        #Push updated User Data into IMS Backend
+        # Persist as xcap_profile (the column the GUI/API and UDR fallback use)
+        # and clear the deprecated sh_profile so it cannot shadow on the next UDR.
         try:
-            self.database.UpdateObj(IMS_SUBSCRIBER, {'sh_profile': sh_user_data}, subscriber_ims_details['ims_subscriber_id'])
-            self.logTool.log(service='HSS', level='debug', message="Updated IMS Subscriber with new Sh Profile", redisClient=self.redisMessaging)
+            self.database.UpdateObj(IMS_SUBSCRIBER, {'xcap_profile': sh_user_data, 'sh_profile': None}, subscriber_ims_details['ims_subscriber_id'])
+            self.logTool.log(service='HSS', level='debug', message="Updated IMS Subscriber with new xcap_profile from Sh PUR", redisClient=self.redisMessaging)
         except Exception as e:
             self.logTool.log(service='HSS', level='error', message="Failed to update IMS Subscriber with new Sh Profile", redisClient=self.redisMessaging)
             self.logTool.log(service='HSS', level='error', message=f"{traceback.format_exc()}", redisClient=self.redisMessaging)
@@ -4355,6 +4335,17 @@ class Diameter:
             avp += self.generate_avp(297, 40, avp_experimental_result)                                      #AVP Experimental-Result(297)
             response = self.generate_diameter_packet("01", "40", 306, 16777217, packet_vars['hop-by-hop-identifier'], packet_vars['end-to-end-identifier'], avp)     #Generate Diameter packet
             return response
+
+        subscriber_ims_details['xcap_profile'] = sh_user_data
+        subscriber_ims_details['sh_profile'] = None
+        try:
+            self.database.handleGeored({"imsi": str(subscriber_ims_details.get('imsi')), "xcap_profile": sh_user_data})
+        except Exception:
+            self.logTool.log(service='HSS', level='warning', message=f"[Sh] [PUR] Geored of xcap_profile failed: {traceback.format_exc()}", redisClient=self.redisMessaging)
+        try:
+            self.notify_sh_profile_subscribers(subscriber_ims_details)
+        except Exception:
+            self.logTool.log(service='HSS', level='warning', message=f"[Sh] [PUR] Local PNR after PUR failed: {traceback.format_exc()}", redisClient=self.redisMessaging)
 
         avp += self.generate_avp(268, 40, "000007d1")                        
 
@@ -4407,6 +4398,41 @@ class Diameter:
         if not repository_data:
             return '<?xml version="1.0" encoding="UTF-8"?>\n<Sh-Data />'
         return '<?xml version="1.0" encoding="UTF-8"?>\n<Sh-Data>\n' + repository_data + '\n</Sh-Data>'
+
+    def notify_sh_profile_subscribers(self, ims_subscriber_data):
+        """Send Sh PNR (TS 29.328 §6.1.4) to ASs whose SNR is in this node's Redis.
+
+        Does not relay to other PyHSS nodes; geored of xcap_profile covers that
+        so each Diameter peer can PNR the subscriptions it holds locally.
+        """
+        ims_subscriber_id = ims_subscriber_data.get('ims_subscriber_id')
+        subscriptions = self.sh_get_subscriptions(ims_subscriber_id)
+        if not subscriptions:
+            return
+        msisdn = ims_subscriber_data.get('msisdn')
+        public_identity = None
+        if msisdn:
+            mnc = self.MNC.zfill(3)
+            mcc = self.MCC.zfill(3)
+            public_identity = f"sip:+{msisdn}@ims.mnc{mnc}.mcc{mcc}.3gppnetwork.org"
+        for origin_host, subscription in subscriptions.items():
+            if not isinstance(subscription, dict):
+                subscription = {}
+            service_indications = subscription.get('serviceIndications') or [None]
+            user_data = self.sh_build_notification_user_data(ims_subscriber_data, service_indications[0])
+            sent = self.sendDiameterRequest(
+                requestType='PNR',
+                hostname=origin_host,
+                destinationHost=origin_host,
+                destinationRealm=subscription.get('originRealm'),
+                msisdn=msisdn,
+                publicIdentity=public_identity,
+                userData=user_data,
+            )
+            if sent:
+                self.logTool.log(service='HSS', level='info', message=f"[Sh] [PUR] Sent PNR to {origin_host} for ims_subscriber {ims_subscriber_id}", redisClient=self.redisMessaging)
+            else:
+                self.logTool.log(service='HSS', level='warning', message=f"[Sh] [PUR] PNR to {origin_host} for ims_subscriber {ims_subscriber_id} was not sent: AS peer not connected and no DRA route available", redisClient=self.redisMessaging)
 
     #3GPP Sh Subscribe-Notifications Answer (TS 29.328 section 6.1.3)
     def Answer_16777217_308(self, packet_vars, avps):
