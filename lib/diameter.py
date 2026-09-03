@@ -168,8 +168,9 @@ class Diameter:
             self._initialize_zn_interface()
 
         self.diameterRequestList = [
-                # Gx PCEF/PCRF
+                # Cx IMS
                 {"commandCode": 304, "applicationId": 16777216, "requestMethod": self.Request_16777216_304, "failureResultCode": 5012 ,"requestAcronym": "RTR", "responseAcronym": "RTA", "requestName": "Registration Termination Request", "responseName": "Registration Termination Answer"},
+                {"commandCode": 305, "applicationId": 16777216, "requestMethod": self.Request_16777216_305, "failureResultCode": 5012 ,"requestAcronym": "PPR", "responseAcronym": "PPA", "requestName": "Push Profile Request", "responseName": "Push Profile Answer"},
 
                 # Re OCS
                 {"commandCode": 258, "applicationId": 16777238, "requestMethod": self.Request_16777238_258, "failureResultCode": 5012 ,"requestAcronym": "RAR", "responseAcronym": "RAA", "requestName": "Re Auth Request", "responseName": "Re Auth Answer"},
@@ -187,6 +188,11 @@ class Diameter:
                 {"commandCode": 309, "applicationId": 16777217, "requestMethod": self.Request_16777217_309, "failureResultCode": 5012 ,"requestAcronym": "PNR", "responseAcronym": "PNA", "requestName": "Push Notification Request", "responseName": "Push Notification Answer"},
 
         ]
+
+        if config.get('hss', {}).get('SWx_enabled', True):
+            self.diameterRequestList.append(
+                {"commandCode": 304, "applicationId": 16777265, "requestMethod": self.Request_16777265_304, "failureResultCode": 5012, "requestAcronym": "SWX_RTR", "responseAcronym": "SWX_RTA", "requestName": "SWx Registration Termination Request", "responseName": "SWx Registration Termination Answer"},
+            )
 
     def _initialize_zn_interface(self):
         """
@@ -817,7 +823,7 @@ class Diameter:
         
     def getPeerType(self, originHost: str) -> str:
         try:
-            peerTypes = ['mme', 'pgw', 'pcscf', 'icscf', 'scscf', 'hss', 'ocs', 'dra']
+            peerTypes = ['mme', 'pgw', 'pcscf', 'icscf', 'scscf', 'hss', 'ocs', 'dra', 'aaa']
 
             for peer in peerTypes:
                 if peer in originHost.lower():
@@ -912,7 +918,7 @@ class Diameter:
     def getConnectedPeersByType(self, peerType: str) -> list:
         try:
             requestedPeerType = peerType.lower()
-            peerTypes = ['mme', 'pgw', 'pcscf', 'icscf', 'scscf', 'hss', 'ocs', 'dra']
+            peerTypes = ['mme', 'pgw', 'pcscf', 'icscf', 'scscf', 'hss', 'ocs', 'dra', 'aaa']
             filteredConnectedPeers = []
 
             if requestedPeerType not in peerTypes:
@@ -1509,7 +1515,7 @@ class Diameter:
                     servingScscf = servingScscf.split(';')[0]
                 self.sendDiameterRequest(
                 requestType='RTR',
-                peerType=servingScscfPeer,
+                hostname=servingScscfPeer,
                 imsi=imsi,
                 destinationHost=servingScscf, 
                 destinationRealm=servingScscfRealm, 
@@ -3204,6 +3210,35 @@ class Diameter:
         response = self.generate_diameter_packet("01", "40", 300, 16777216, packet_vars['hop-by-hop-identifier'], packet_vars['end-to-end-identifier'], avp)     #Generate Diameter packet
         return response
 
+    def build_cx_user_data(self, ims_subscriber_details) -> str:
+        """Render the Cx-User-Data XML for an IMS subscriber (SAA / PPR)."""
+        details = dict(ims_subscriber_details)
+        details['mnc'] = self.MNC.zfill(3)
+        details['mcc'] = self.MCC.zfill(3)
+
+        template = None
+        if self.ifcCacheEnabled:
+            template = self.ifcTemplateCache.get_template(details, config, self.database)
+        else:
+            if self.ifcUseDatabase and details.get('ifc_template_id'):
+                template_id = details['ifc_template_id']
+                self.logTool.log(service='HSS', level='debug', message=f"Loading iFC from database template ID {template_id}", redisClient=self.redisMessaging)
+                template_data = self.database.GetObj(IFC_TEMPLATE, template_id)
+                if template_data and 'template_content' in template_data:
+                    template = jinja2.Template(template_data['template_content'])
+
+            if template is None:
+                ifc_path = details.get('ifc_path') or self.ifcDefaultTemplatePath
+                self.logTool.log(service='HSS', level='debug', message="Loading iFC from path " + str(ifc_path), redisClient=self.redisMessaging)
+                templateLoader = jinja2.FileSystemLoader(searchpath="../")
+                templateEnv = jinja2.Environment(loader=templateLoader)
+                template = templateEnv.get_template(ifc_path)
+
+        if template is None:
+            raise ValueError("Failed to load iFC template")
+
+        return template.render(iFC_vars=details)
+
     #3GPP Cx Server Assignment Answer
     def Answer_16777216_301(self, packet_vars, avps):
         avp = ''                                                                                    #Initiate empty var AVP                                                                                           #Session-ID
@@ -3250,39 +3285,11 @@ class Diameter:
 
         avp += self.generate_avp(1, 40, str(binascii.hexlify(str.encode(str(imsi) + '@' + str(domain))),'ascii'))
         #Cx-User-Data (XML)
-        
-        #These variables are passed to the template for use
-        ims_subscriber_details['mnc'] = self.MNC.zfill(3)
-        ims_subscriber_details['mcc'] = self.MCC.zfill(3)
-        
-        # Load iFC template using cache (with config-based source selection)
-        template = None
-        if self.ifcCacheEnabled:
-            # Use the template cache for optimized loading
-            template = self.ifcTemplateCache.get_template(ims_subscriber_details, config, self.database)
-        else:
-            # Direct loading without cache (not recommended for production)
-            if self.ifcUseDatabase and ims_subscriber_details.get('ifc_template_id'):
-                # Load from database
-                template_id = ims_subscriber_details['ifc_template_id']
-                self.logTool.log(service='HSS', level='debug', message=f"Loading iFC from database template ID {template_id}", redisClient=self.redisMessaging)
-                template_data = self.database.GetObj(IFC_TEMPLATE, template_id)
-                if template_data and 'template_content' in template_data:
-                    template = jinja2.Template(template_data['template_content'])
-            
-            if template is None:
-                # Fall back to file-based loading
-                ifc_path = ims_subscriber_details.get('ifc_path') or self.ifcDefaultTemplatePath
-                self.logTool.log(service='HSS', level='debug', message="Loading iFC from path " + str(ifc_path), redisClient=self.redisMessaging)
-                templateLoader = jinja2.FileSystemLoader(searchpath="../")
-                templateEnv = jinja2.Environment(loader=templateLoader)
-                template = templateEnv.get_template(ifc_path)
-        
-        if template is None:
+        try:
+            xmlbody = self.build_cx_user_data(ims_subscriber_details)
+        except ValueError:
             self.logTool.log(service='HSS', level='error', message="Failed to load iFC template", redisClient=self.redisMessaging)
-            raise ValueError("Failed to load iFC template")
-
-        xmlbody = template.render(iFC_vars=ims_subscriber_details)  # this is where to put args to the template renderer
+            raise
         avp += self.generate_vendor_avp(606, "c0", 10415, str(binascii.hexlify(str.encode(xmlbody)),'ascii'))
         
         #Charging Information
@@ -5854,33 +5861,82 @@ class Diameter:
         return response
 
     #3GPP Cx Registration Termination Request (RTR)
-    def Request_16777216_304(self, imsi, domain, destinationHost, destinationRealm):
-        avp = ''                                                                                    #Initiate empty var AVP                                                                                           #Session-ID
-        sessionid = str(bytes.fromhex(self.OriginHost).decode('ascii')) + ';' + self.generate_id(5) + ';1;app_cx'                           #Session state generate
-        avp += self.generate_avp(263, 40, str(binascii.hexlify(str.encode(sessionid)),'ascii'))          #Session ID AVP
-        avp += self.generate_avp(260, 40, "000001024000000c" + format(int(16777216),"x").zfill(8) +  "0000010a4000000c000028af")      #Vendor-Specific-Application-ID (Cx)
-        
-        avp += self.generate_avp(264, 40, self.OriginHost)                                                    #Origin Host
-        avp += self.generate_avp(296, 40, self.OriginRealm)                                                   #Origin Realm
-        
-        #SIP-Deregistration-Reason
-        reason_code_avp = self.generate_vendor_avp(616, "c0", 10415, "00000000")
-        reason_info_avp = self.generate_vendor_avp(617, "c0", 10415, self.string_to_hex("Administrative Deregistration"))
-        avp += self.generate_vendor_avp(615, "c0", 10415, reason_code_avp + reason_info_avp)
-        
-        avp += self.generate_avp(283, 40, self.string_to_hex(destinationRealm))                 #Destination Realm
-        avp += self.generate_avp(293, 40, self.string_to_hex(destinationHost))                 #Destination Host
-        
-        avp += self.generate_avp(277, 40, "00000001")                                                    #Auth-Session-State (Not maintained)
-        avp += self.generate_avp(1, 40, self.string_to_hex(str(imsi) + "@" + domain))                         #User-Name
-        avp += self.generate_vendor_avp(601, "c0", 10415, self.string_to_hex("sip:" + str(imsi) + "@" + domain))                      #Public-Identity
-        avp += self.generate_vendor_avp(602, "c0", 10415, self.ProductName)                         #Server-Name
-        
-        #* [ Route-Record ]
-        avp += self.generate_avp(282, "40", self.OriginHost)
-    
-        response = self.generate_diameter_packet("01", "c0", 304, 16777216, self.generate_id(4), self.generate_id(4), avp)     #Generate Diameter packet
+    def Request_16777216_304(self, imsi, domain, destinationHost, destinationRealm, publicIdentities=None, reasonCode=0, reasonInfo="Administrative Deregistration"):
+        avp = ''
+        sessionid = str(bytes.fromhex(self.OriginHost).decode('ascii')) + ';' + self.generate_id(5) + ';1;app_cx'
+        avp += self.generate_avp(263, 40, str(binascii.hexlify(str.encode(sessionid)),'ascii'))
+        avp += self.generate_avp(260, 40, "000001024000000c" + format(int(16777216),"x").zfill(8) +  "0000010a4000000c000028af")
 
+        avp += self.generate_avp(264, 40, self.OriginHost)
+        avp += self.generate_avp(296, 40, self.OriginRealm)
+
+        reason_code_avp = self.generate_vendor_avp(616, "c0", 10415, self.int_to_hex(int(reasonCode), 4))
+        reason_info_avp = self.generate_vendor_avp(617, "c0", 10415, self.string_to_hex(str(reasonInfo)))
+        avp += self.generate_vendor_avp(615, "c0", 10415, reason_code_avp + reason_info_avp)
+
+        avp += self.generate_avp(283, 40, self.string_to_hex(destinationRealm))
+        if destinationHost is not None:
+            avp += self.generate_avp(293, 40, self.string_to_hex(destinationHost))
+
+        avp += self.generate_avp(277, 40, "00000001")
+        user_name = str(imsi) + "@" + str(domain)
+        avp += self.generate_avp(1, 40, self.string_to_hex(user_name))
+
+        identities = publicIdentities if publicIdentities else [f"sip:{imsi}@{domain}"]
+        for public_identity in identities:
+            avp += self.generate_vendor_avp(601, "c0", 10415, self.string_to_hex(str(public_identity)))
+
+        avp += self.generate_vendor_avp(602, "c0", 10415, self.ProductName)
+        avp += self.generate_avp(282, "40", self.OriginHost)
+
+        response = self.generate_diameter_packet("01", "c0", 304, 16777216, self.generate_id(4), self.generate_id(4), avp)
+        return response
+
+    #3GPP Cx Push Profile Request (PPR)
+    def Request_16777216_305(self, imsi, domain, destinationHost, destinationRealm, cxUserData):
+        avp = ''
+        sessionid = str(bytes.fromhex(self.OriginHost).decode('ascii')) + ';' + self.generate_id(5) + ';1;app_cx'
+        avp += self.generate_avp(263, 40, str(binascii.hexlify(str.encode(sessionid)),'ascii'))
+        avp += self.generate_avp(260, 40, "000001024000000c" + format(int(16777216),"x").zfill(8) +  "0000010a4000000c000028af")
+
+        avp += self.generate_avp(264, 40, self.OriginHost)
+        avp += self.generate_avp(296, 40, self.OriginRealm)
+        avp += self.generate_avp(283, 40, self.string_to_hex(destinationRealm))
+        if destinationHost is not None:
+            avp += self.generate_avp(293, 40, self.string_to_hex(destinationHost))
+
+        avp += self.generate_avp(277, 40, "00000001")
+        user_name = str(imsi) + "@" + str(domain)
+        avp += self.generate_avp(1, 40, self.string_to_hex(user_name))
+        avp += self.generate_vendor_avp(606, "c0", 10415, str(binascii.hexlify(str.encode(cxUserData)),'ascii'))
+        avp += self.generate_avp(282, "40", self.OriginHost)
+
+        response = self.generate_diameter_packet("01", "c0", 305, 16777216, self.generate_id(4), self.generate_id(4), avp)
+        return response
+
+    #3GPP SWx Registration Termination Request (RTR)
+    def Request_16777265_304(self, imsi, destinationRealm, destinationHost=None, reasonCode=0, reasonInfo="Administrative Deregistration"):
+        avp = ''
+        sessionid = str(bytes.fromhex(self.OriginHost).decode('ascii')) + ';' + self.generate_id(5) + ';1;app_swx'
+        avp += self.generate_avp(263, 40, str(binascii.hexlify(str.encode(sessionid)),'ascii'))
+        avp += self.generate_avp(260, 40, "000001024000000c" + format(int(16777265),"x").zfill(8) +  "0000010a4000000c000028af")
+
+        avp += self.generate_avp(264, 40, self.OriginHost)
+        avp += self.generate_avp(296, 40, self.OriginRealm)
+        avp += self.generate_avp(283, 40, self.string_to_hex(destinationRealm))
+        if destinationHost is not None:
+            avp += self.generate_avp(293, 40, self.string_to_hex(destinationHost))
+
+        avp += self.generate_avp(277, 40, "00000001")
+        avp += self.generate_avp(1, 40, self.string_to_hex(str(imsi)))
+
+        reason_code_avp = self.generate_vendor_avp(616, "c0", 10415, self.int_to_hex(int(reasonCode), 4))
+        reason_info_avp = self.generate_vendor_avp(617, "c0", 10415, self.string_to_hex(str(reasonInfo)))
+        avp += self.generate_vendor_avp(615, "c0", 10415, reason_code_avp + reason_info_avp)
+
+        avp += self.generate_avp(282, "40", self.OriginHost)
+
+        response = self.generate_diameter_packet("01", "c0", 304, 16777265, self.generate_id(4), self.generate_id(4), avp)
         return response
 
     #3GPP Sh User-Data Request (UDR)

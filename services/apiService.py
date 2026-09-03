@@ -27,6 +27,12 @@ from diameter import Diameter
 from messaging import RedisMessaging
 from baseModels import SubscriberInfo
 import database
+from network_control import (
+    teardown_subscriber,
+    push_ims_profile,
+    ims_profile_push_fields_changed,
+    push_ppr_for_ifc_template_subscribers,
+)
 from pyhss_config import config
 from enum_management import ENUMClient, ENUMManagementError
 
@@ -165,7 +171,77 @@ def relay_sh_profile_update(ims_subscriber_data):
                 logTool.log(service='API', level='warning', message=f"[API] Sh notify relay to {url} failed: {e}", redisClient=redisMessaging)
 
 
-def notify_subscribed_application_servers(ims_subscriber_data):
+def relay_to_diameter_nodes(path, payload):
+    """Fan out a Diameter-side action to HSS Diameter API pods.
+
+    Provisioning and Diameter run in separate pods with separate Redis, so
+    outbound CLR/RTR/PPR must be executed on the Diameter nodes that hold the
+    peer table. Uses the same SH_NOTIFY_ENDPOINTS headless-service expansion
+    as Sh PNR relay. Diameter nodes must not call this helper (no loop).
+    """
+    endpoints = config.get('hss', {}).get('sh_notify_endpoints', []) or []
+    if not endpoints:
+        return
+    for endpoint in endpoints:
+        parsed = urlparse(endpoint)
+        host = parsed.hostname
+        port = parsed.port or 8080
+        try:
+            addresses = sorted({addrinfo[4][0] for addrinfo in socket.getaddrinfo(host, port, proto=socket.IPPROTO_TCP)})
+        except Exception as e:
+            logTool.log(service='API', level='warning', message=f"[API] Diameter relay: failed to resolve {host}: {e}", redisClient=redisMessaging)
+            continue
+        for address in addresses:
+            urlHost = f"[{address}]" if ':' in address else address
+            url = f"{parsed.scheme}://{urlHost}:{port}{path}"
+            try:
+                requests.post(url, json=payload, timeout=2)
+                logTool.log(service='API', level='debug', message=f"[API] Diameter relay sent to {url}", redisClient=redisMessaging)
+            except Exception as e:
+                logTool.log(service='API', level='warning', message=f"[API] Diameter relay to {url} failed: {e}", redisClient=redisMessaging)
+
+
+def teardown_subscriber_and_relay(imsi, domains):
+    # Keep serving-node fields until Diameter pods have sent CLR/RTR.
+    warnings = teardown_subscriber(
+        diameterClient,
+        databaseClient,
+        imsi,
+        domains=domains,
+        diameter_realm=originRealm,
+        mcc=mcc,
+        mnc=mnc,
+        clear_serving_state=False,
+        log_tool=logTool,
+        redis_messaging=redisMessaging,
+    )
+    relay_to_diameter_nodes('/geored/network_teardown', {'imsi': imsi, 'domains': list(domains)})
+    if 'epc' in domains:
+        try:
+            databaseClient.Update_Serving_MME(imsi=imsi, serving_mme=None)
+        except Exception as exc:
+            warnings.append(f"Failed to clear serving MME for IMSI {imsi}: {exc}")
+    if 'ims' in domains:
+        try:
+            databaseClient.Update_Serving_CSCF(imsi=imsi, serving_cscf=None)
+        except Exception as exc:
+            warnings.append(f"Failed to clear serving S-CSCF for IMSI {imsi}: {exc}")
+    return warnings
+
+
+def push_ims_profile_and_relay(ims_subscriber):
+    warnings = push_ims_profile(
+        diameterClient,
+        ims_subscriber,
+        mcc=mcc,
+        mnc=mnc,
+        log_tool=logTool,
+        redis_messaging=redisMessaging,
+    )
+    imsi = ims_subscriber.get('imsi')
+    if imsi:
+        relay_to_diameter_nodes('/geored/push_ims_profile', {'imsi': imsi})
+    return warnings
     """Send PNRs for subscriptions held locally and relay the change to any
     configured remote PyHSS nodes that hold their own subscriptions."""
     send_pnr_for_local_subscriptions(ims_subscriber_data)
@@ -668,7 +744,15 @@ class PyHSS_SUBSCRIBER_Get(Resource):
         try:
             args = parser.parse_args()
             operation_id = args.get('operation_id', None)
+            subscriber_data = databaseClient.GetObj(SUBSCRIBER, subscriber_id)
+            imsi = subscriber_data.get('imsi')
+            warnings = []
+            if imsi:
+                warnings = teardown_subscriber_and_relay(imsi, ['epc', 'ims', 'swx'])
             data = databaseClient.DeleteObj(SUBSCRIBER, subscriber_id, False, operation_id)
+            if warnings:
+                data = dict(data) if isinstance(data, dict) else {'result': data}
+                data['warnings'] = warnings
             return data, 200
         except Exception as E:
             print(E)
@@ -686,32 +770,25 @@ class PyHSS_SUBSCRIBER_Get(Resource):
                 return {"error": str(validation_error)}, 400
             args = parser.parse_args()
             operation_id = args.get('operation_id', None)
+
+            existing_subscriber = databaseClient.GetObj(SUBSCRIBER, subscriber_id)
             data = databaseClient.UpdateObj(SUBSCRIBER, json_data, subscriber_id, False, operation_id)
+            warnings = []
 
             #If the subscriber is enabled, trigger an ISD in 2G
             if 'enabled' in json_data and json_data['enabled'] == True:
-                update_event = databaseClient.Get_Gsup_SubscriberInfo(json_data['imsi'])
+                update_event = databaseClient.Get_Gsup_SubscriberInfo(json_data.get('imsi', existing_subscriber.get('imsi')))
                 redisMessaging.sendMessage('subscriber_update', update_event.model_dump_json())
 
-            #If the "enabled" flag on the subscriber is now disabled, trigger a CLR
+            #If the "enabled" flag on the subscriber is now disabled, tear down live sessions
             if 'enabled' in json_data and json_data['enabled'] == False:
-                print("Subscriber is now disabled, checking to see if we need to trigger a CLR")
-                #See if we have a serving MME set
-                try:
-                    assert(json_data['serving_mme'])
-                    print("Serving MME set - Sending CLR")
+                imsi = data.get('imsi') or existing_subscriber.get('imsi')
+                if imsi:
+                    warnings = teardown_subscriber_and_relay(imsi, ['epc', 'ims', 'swx'])
 
-                    diameterClient.sendDiameterRequest(
-                        requestType='CLR',
-                        hostname=json_data['serving_mme'],
-                        imsi=json_data['imsi'], 
-                        DestinationHost=json_data['serving_mme'], 
-                        DestinationRealm=json_data['serving_mme_realm'], 
-                        CancellationType=1
-                    )
-                    print("Sent CLR via Peer " + str(json_data['serving_mme']))
-                except:
-                    print("No serving MME set - Not sending CLR")
+            if warnings:
+                data = dict(data) if isinstance(data, dict) else {'result': data}
+                data['warnings'] = warnings
             return data, 200
         except Exception as E:
             print(E)
@@ -849,6 +926,10 @@ class PyHSS_IMS_SUBSCRIBER_Get(Resource):
             subscriber_data = databaseClient.GetObj(IMS_SUBSCRIBER, ims_subscriber_id)
             msisdn = subscriber_data.get('msisdn')
             msisdn_list = subscriber_data.get('msisdn_list')
+            imsi = subscriber_data.get('imsi')
+            warnings = []
+            if imsi:
+                warnings = teardown_subscriber_and_relay(imsi, ['ims'])
 
             args = parser.parse_args()
             operation_id = args.get('operation_id', None)
@@ -861,6 +942,9 @@ class PyHSS_IMS_SUBSCRIBER_Get(Resource):
                 # In strict mode, log the error but don't fail - subscriber is already deleted
                 logTool.log(service='API', level='error', message=f"[API] ENUM deletion failed after subscriber deletion: {enum_error}", redisClient=redisMessaging)
 
+            if warnings:
+                data = dict(data) if isinstance(data, dict) else {'result': data}
+                data['warnings'] = warnings
             return data, 200
         except Exception as E:
             print(E)
@@ -907,6 +991,13 @@ class PyHSS_IMS_SUBSCRIBER_Get(Resource):
                 except Exception as pnr_error:
                     logTool.log(service='API', level='error', message=f"[API] Sh PNR notification failed: {pnr_error}", redisClient=redisMessaging)
 
+            warnings = []
+            if ims_profile_push_fields_changed(old_subscriber, json_data):
+                warnings = push_ims_profile_and_relay(data)
+
+            if warnings:
+                data = dict(data) if isinstance(data, dict) else {'result': data}
+                data['warnings'] = warnings
             return data, 200
         except Exception as E:
             print(E)
@@ -1496,65 +1587,8 @@ class PyHSS_OAM_Deregister(Resource):
             subscriberInfo = databaseClient.Get_Subscriber(imsi=str(imsi))
             imsSubscriberInfo = databaseClient.Get_IMS_Subscriber(imsi=str(imsi))
             subscriberId = subscriberInfo.get('subscriber_id', None)
-            servingMmePeer = subscriberInfo.get('serving_mme_peer', None)
-            servingMme = subscriberInfo.get('serving_mme', None)
-            servingMmeRealm = subscriberInfo.get('serving_mme_realm', None)
-            servingScscf = subscriberInfo.get('scscf', None)
-            servingScscfPeer = imsSubscriberInfo.get('scscf_peer', None)
-            servingScscfRealm = imsSubscriberInfo.get('scscf_realm', None)
-            
-            if servingMmePeer is not None and servingMmeRealm is not None and servingMme is not None:
-                if ';' in servingMmePeer:
-                    servingMmePeer = servingMmePeer.split(';')[0]
 
-                # Send the CLR to the serving MME
-                diameterClient.sendDiameterRequest(
-                requestType='CLR',
-                hostname=servingMmePeer,
-                imsi=imsi, 
-                DestinationHost=servingMme, 
-                DestinationRealm=servingMmeRealm, 
-                CancellationType=2
-                )
-            
-            #Broadcast the CLR to all connected MME's, regardless of whether the subscriber is attached.
-            diameterClient.broadcastDiameterRequest(
-            requestType='CLR',
-            peerType='MME',
-            imsi=imsi, 
-            DestinationHost=servingMme, 
-            DestinationRealm=servingMmeRealm, 
-            CancellationType=2
-            )
-
-            databaseClient.Update_Serving_MME(imsi=imsi, serving_mme=None)
-
-            if servingScscfPeer is not None and servingScscfRealm is not None and servingScscf is not None:
-                if ';' in servingScscfPeer:
-                    servingScscfPeer = servingScscfPeer.split(';')[0]
-                servingScscf = servingScscf.replace('sip:', '')
-                if ';' in servingScscf:
-                    servingScscf = servingScscf.split(';')[0]
-                diameterClient.sendDiameterRequest(
-                requestType='RTR',
-                peerType=servingScscfPeer,
-                imsi=imsi,
-                destinationHost=servingScscf, 
-                destinationRealm=servingScscfRealm, 
-                domain=servingScscfRealm
-                )
-
-            #Broadcast the RTR to all connected SCSCF's, regardless of whether the subscriber is attached.
-            diameterClient.broadcastDiameterRequest(
-            requestType='RTR',
-            peerType='SCSCF',
-            imsi=imsi,
-            destinationHost=servingScscf, 
-            destinationRealm=servingScscfRealm, 
-            domain=servingScscfRealm
-            )
-
-            databaseClient.Update_Serving_CSCF(imsi=imsi, serving_cscf=None)
+            warnings = teardown_subscriber_and_relay(imsi, ['epc', 'ims', 'swx'])
 
             # If a subscriber has an active serving apn, grab the pcrf session id for that apn and send a CCR-T, then a Registration Termination Request to the serving pgw peer.
             if subscriberId is not None:
@@ -1625,7 +1659,10 @@ class PyHSS_OAM_Deregister(Resource):
             imsSubscriberInfo = databaseClient.Get_IMS_Subscriber(imsi=str(imsi))
             servingApns = databaseClient.Get_Serving_APNs(subscriber_id=subscriberId)
 
-            return {'subscriber': subscriberInfo, 'ims_subscriber': imsSubscriberInfo, 'pcrf': servingApns}, 200
+            response = {'subscriber': subscriberInfo, 'ims_subscriber': imsSubscriberInfo, 'pcrf': servingApns}
+            if warnings:
+                response['warnings'] = warnings
+            return response, 200
         except Exception as E:
             print(E)
             return handle_exception(E)
@@ -2243,6 +2280,85 @@ class PyHSS_Geored_Sh_Profile_Updated(Resource):
             print(E)
             return handle_exception(E)
 
+@ns_geored.route('/network_teardown')
+class PyHSS_Geored_Network_Teardown(Resource):
+    @ns_geored.doc('Execute HSS-initiated CLR/RTR/SWx-RTR using this node Diameter peer table')
+    @no_auth_required
+    def post(self):
+        '''Send S6a CLR, Cx RTR and/or SWx RTR for the given IMSI from this Diameter node'''
+        try:
+            json_data = request.get_json(force=True)
+            imsi = json_data.get('imsi')
+            if not imsi:
+                return {'error': 'imsi is required'}, 400
+            domains = json_data.get('domains') or ['epc', 'ims', 'swx']
+            warnings = teardown_subscriber(
+                diameterClient,
+                databaseClient,
+                imsi,
+                domains=domains,
+                diameter_realm=originRealm,
+                mcc=mcc,
+                mnc=mnc,
+                clear_serving_state=False,
+                log_tool=logTool,
+                redis_messaging=redisMessaging,
+            )
+            return {'result': 'OK', 'warnings': warnings}, 200
+        except Exception as E:
+            print(E)
+            return handle_exception(E)
+
+@ns_geored.route('/push_ims_profile')
+class PyHSS_Geored_Push_Ims_Profile(Resource):
+    @ns_geored.doc('Send Cx PPR from this Diameter node')
+    @no_auth_required
+    def post(self):
+        '''Send Cx PPR for a registered IMS subscriber from this Diameter node'''
+        try:
+            json_data = request.get_json(force=True)
+            imsi = json_data.get('imsi')
+            if not imsi:
+                return {'error': 'imsi is required'}, 400
+            ims_data = databaseClient.Get_IMS_Subscriber(imsi=str(imsi))
+            warnings = push_ims_profile(
+                diameterClient,
+                ims_data,
+                mcc=mcc,
+                mnc=mnc,
+                log_tool=logTool,
+                redis_messaging=redisMessaging,
+            )
+            return {'result': 'OK', 'warnings': warnings}, 200
+        except Exception as E:
+            print(E)
+            return handle_exception(E)
+
+@ns_geored.route('/push_ifc_template')
+class PyHSS_Geored_Push_Ifc_Template(Resource):
+    @ns_geored.doc('Fan out Cx PPR for an iFC template from this Diameter node')
+    @no_auth_required
+    def post(self):
+        '''Send Cx PPR to S-CSCFs of registered subscribers using the given iFC template'''
+        try:
+            json_data = request.get_json(force=True)
+            ifc_template_id = json_data.get('ifc_template_id')
+            if ifc_template_id is None:
+                return {'error': 'ifc_template_id is required'}, 400
+            warnings = push_ppr_for_ifc_template_subscribers(
+                diameterClient,
+                databaseClient,
+                int(ifc_template_id),
+                mcc=mcc,
+                mnc=mnc,
+                log_tool=logTool,
+                redis_messaging=redisMessaging,
+            )
+            return {'result': 'OK', 'warnings': warnings}, 200
+        except Exception as E:
+            print(E)
+            return handle_exception(E)
+
 @ns_geored.route('/rx_terminate_af_subscriptions')
 class PyHSS_Geored_Rx_Terminate_Af_Subscriptions(Resource):
     @ns_geored.doc('Receive a Gx CCR-T termination relay and abort matching Rx AF subscriptions')
@@ -2655,6 +2771,23 @@ class PyHSS_IFC_Template_Get(Resource):
                 redisMessaging.publish('ifc_template_invalidation', invalidation_msg)
             except Exception as pub_error:
                 print(f"Warning: Failed to publish cache invalidation: {pub_error}")
+
+            warnings = []
+            if 'template_content' in json_data:
+                warnings = push_ppr_for_ifc_template_subscribers(
+                    diameterClient,
+                    databaseClient,
+                    int(ifc_template_id),
+                    mcc=mcc,
+                    mnc=mnc,
+                    log_tool=logTool,
+                    redis_messaging=redisMessaging,
+                )
+                relay_to_diameter_nodes('/geored/push_ifc_template', {'ifc_template_id': int(ifc_template_id)})
+
+            if warnings:
+                data = dict(data) if isinstance(data, dict) else {'result': data}
+                data['warnings'] = warnings
             return data, 200
         except Exception as E:
             print(E)

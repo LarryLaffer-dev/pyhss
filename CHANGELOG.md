@@ -7,9 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.7.8] - 2026-09-03
+
+### Added
+
+- HSS-initiated network teardown on subscriber delete, IMS-subscriber delete, `PATCH /subscriber` with `enabled: false`, and `GET /oam/deregister/<imsi>`: sends S6a CLR (Cancellation-Type `SUBSCRIPTION_WITHDRAWAL`), Cx RTR with stored IMPUs, and SWx RTR to AAA peers; clears serving MME/S-CSCF state (image `hss:1.7.8`).
+- Cx Push-Profile (PPR/PPA, command 305): sent to the serving S-CSCF when an IMS subscriber's `ifc_template_id`, `ifc_path`, `msisdn`, or `msisdn_list` changes, and fan-out to registered subscribers when an iFC template's `template_content` is updated (image `hss:1.7.8`).
+- Shared `network_control` helper for CLR/Cx-RTR/SWx-RTR teardown and Cx PPR profile push; API responses include a `warnings` list for best-effort Diameter failures. In split provisioning/Diameter deployments the API relays teardown and PPR to Diameter pods via `/geored/network_teardown` and `/geored/push_ims_profile` (image `hss:1.7.8`).
+
+### Fixed
+
+- Cx RTR now includes all stored IMPUs (`sip:+<msisdn>@...`, `tel:+...`, extras from `msisdn_list`) instead of a hardcoded `sip:<imsi>@` identity (image `hss:1.7.8`).
+- `PATCH /subscriber` `enabled: false` now reads serving nodes from the database and sends CLR type 2 (was type 1 and required `serving_mme` in the PATCH body) (image `hss:1.7.8`).
+- Fixed `deregisterIms()` and targeted Cx RTR call sites that passed `peerType=` instead of `hostname=` to `sendDiameterRequest` (image `hss:1.7.8`).
+
 ### Added
 
 - Sh PUR (command 307) now writes `xcap_profile` (and clears the deprecated `sh_profile` column) and georeds `{imsi, xcap_profile}` to peer APIs, including the provisioning master, so Ut/XCAP edits and a master backup see the same repository data. `PATCH /geored/` accepts `xcap_profile` and PNRs local SNR subscriptions without looping through `sh_notify_endpoints`. Helm env vars `ENABLE_GEO_REDUNDANCY`, `SYNC_ENDPOINTS`, `SH_NOTIFY_ENDPOINTS`, and `RX_NOTIFY_ENDPOINTS` overlay `config.yaml` after load (image `hss:1.7.6`).
+
+## [1.7.7] - 2026-03-19
+
+### Added
 
 - Sh Subscribe-Notifications (SNR/SNA, command 308, TS 29.328 §6.1.3): Application Servers can subscribe to (and unsubscribe from) repository-data changes per subscriber and Service-Indication; subscriptions are stored in Redis (shared, unprefixed `sh_subscriptions:<id>` keys) and the SNA attaches the current User-Data when Send-Data-Indication is present (image `hss:1.7.0`).
 - Sh Push-Notification (PNR/PNA, command 309, TS 29.328 §6.1.4): on REST PATCH of an `ims_subscriber` that changes `xcap_profile` / `sh_profile`, the API sends a PNR with the updated `<Sh-Data>` (User-Data AVP 702) to every subscribed AS (image `hss:1.7.0`).
