@@ -325,6 +325,23 @@ class Diameter:
         self.logTool.log(service='HSS', level='debug', message="Encoded PLMN: " + str(plmn), redisClient=self.redisMessaging)
         return plmn
 
+    def EncodePLMN_from_IMSI(self, imsi):
+        """Encoded PLMN (TBCD hex string) from the IMSI's leading MCC/MNC digits.
+
+        Private identities are not always IMSI-shaped (TS 23.003 allows any
+        NAI as IMPI), and a non-digit identity would make EncodePLMN emit
+        non-hex characters that crash binascii.unhexlify inside the crypto
+        helpers (S6a_crypt.generate_maa_vector and friends). Fall back to the
+        configured home PLMN in that case: the MAA / EAP-AKA vector maths
+        never uses the PLMN (it only feeds KASME on the S6a/EUTRAN path), so
+        any valid encoding is acceptable there.
+        """
+        imsi = str(imsi)
+        if len(imsi) >= 5 and imsi[:5].isdigit():
+            return self.EncodePLMN(imsi[0:3], imsi[3:5])
+        self.logTool.log(service='HSS', level='warning', message=f"[diameter.py] [EncodePLMN_from_IMSI] Identity '{imsi}' is not IMSI-shaped - using configured home PLMN {self.MCC}/{self.MNC}", redisClient=self.redisMessaging)
+        return self.EncodePLMN(self.MCC, self.MNC)
+
     def TBCD_special_chars(self, input):
         self.logTool.log(service='HSS', level='debug', message="Special character possible in " + str(input), redisClient=self.redisMessaging)
         if input == "*":
@@ -3502,8 +3519,7 @@ class Diameter:
         
         self.logTool.log(service='HSS', level='debug', message="Got subscriber data for MAA OK", redisClient=self.redisMessaging)
         
-        mcc, mnc = imsi[0:3], imsi[3:5]
-        plmn = self.EncodePLMN(mcc, mnc)
+        plmn = self.EncodePLMN_from_IMSI(imsi)
 
         #Determine if SQN Resync is required & auth type to use
         for sub_avp_612 in self.get_avp_data(avps, 612)[0]:
@@ -3671,8 +3687,7 @@ class Diameter:
             response = self.generate_diameter_packet("01", "40", 303, 16777265, packet_vars['hop-by-hop-identifier'], packet_vars['end-to-end-identifier'], avp)
             return response
 
-        mcc, mnc = imsi[0:3], imsi[3:5]
-        plmn = self.EncodePLMN(mcc, mnc)
+        plmn = self.EncodePLMN_from_IMSI(imsi)
 
         # Determine number of requested auth vectors
         num_items = 1
@@ -6440,11 +6455,11 @@ class Diameter:
         except:
             pass  # Use default if not specified
         
-        # Generate PLMN (TS 23.003) from the IMSI, matching the Cx/S6a MAA path
-        # (see Answer_16777216_303). generate_maa_vector expects the encoded
-        # hex PLMN string produced by EncodePLMN, not an MSISDN.
-        mcc, mnc = imsi[0:3], imsi[3:5]
-        plmn = self.EncodePLMN(mcc, mnc)
+        # Generate the encoded PLMN from the IMSI, matching the Cx/S6a MAA
+        # path (see Answer_16777216_303). generate_maa_vector expects the
+        # encoded hex PLMN string produced by EncodePLMN, not an MSISDN.
+        # Falls back to the configured home PLMN for non-IMSI identities.
+        plmn = self.EncodePLMN_from_IMSI(imsi)
         
         # Generate authentication vectors for GBA via the shared AuC helper.
         # Get_Vectors_AuC(action="sip_auth") mirrors the Cx SIP MAA path: it
