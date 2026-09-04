@@ -10,6 +10,7 @@ when a subscriber is deleted, blocked, or administratively deregistered.
 
 from __future__ import annotations
 
+import os
 import traceback
 from typing import List, Optional, Sequence
 
@@ -157,6 +158,41 @@ def _send_cx_rtr(
         _log(log_tool, redis_messaging, "error", f"[network_control] {msg}\n{traceback.format_exc()}")
 
 
+def _aaa_rtr_destination_hosts(diameter_client, imsi: str) -> List[str]:
+    """AAA Origin-Hosts that must appear as SWx RTR Destination-Host.
+
+    TS 29.273 §8.1.2.3: the RTR goes to the 3GPP AAA Server registered for the
+    subscriber, which the HSS learned from the SWx SAR. When that binding is
+    known it is the only destination; ``SWX_AAA_DESTINATION_HOSTS`` is a
+    fan-out fallback for when no binding exists (e.g. after a Redis flush).
+
+    A Destination-Host is mandatory either way: DRA route ``hss-s6a`` matches
+    Application-Id 16777265 and next-hops the HSS, so an RTR without it is
+    looped straight back. RFC 6733 §6.1.5: a present Destination-Host selects
+    the AAA peer first.
+    """
+    redis = getattr(diameter_client, "redisMessaging", None)
+    if redis is not None:
+        try:
+            bound = redis.getValue(key=f"swx_aaa_server:{imsi}", usePrefix=False)
+            if bound:
+                return [bound.decode("utf-8") if isinstance(bound, bytes) else str(bound)]
+        except Exception:
+            pass
+    hosts: List[str] = []
+    extra = os.environ.get("SWX_AAA_DESTINATION_HOSTS", "")
+    try:
+        from pyhss_config import config as _cfg
+        cfg_hosts = (_cfg.get("hss") or {}).get("swx_aaa_destination_hosts") or extra
+    except Exception:
+        cfg_hosts = extra
+    if isinstance(cfg_hosts, (list, tuple)):
+        hosts.extend(str(h).strip() for h in cfg_hosts if str(h).strip())
+    else:
+        hosts.extend(h.strip() for h in str(cfg_hosts).replace(" ", ",").split(",") if h.strip())
+    return list(dict.fromkeys(hosts))
+
+
 def _send_swx_rtr(
     diameter_client,
     imsi: str,
@@ -165,18 +201,114 @@ def _send_swx_rtr(
     log_tool=None,
     redis_messaging=None,
 ) -> None:
-    try:
-        diameter_client.broadcastDiameterRequest(
-            requestType="SWX_RTR",
-            peerType="aaa",
-            imsi=imsi,
-            destinationRealm=diameter_realm,
+    dest_hosts = _aaa_rtr_destination_hosts(diameter_client, imsi)
+    if not dest_hosts:
+        msg = (
+            f"SWx RTR for IMSI {imsi} skipped: no AAA Destination-Host "
+            f"(set SWX_AAA_DESTINATION_HOSTS or wait for an SWx SAR binding)"
         )
-        _log(log_tool, redis_messaging, "info", f"[network_control] Broadcast SWx RTR for IMSI {imsi}")
+        warnings.append(msg)
+        _log(log_tool, redis_messaging, "warning", f"[network_control] {msg}")
+        return
+    try:
+        sent = 0
+        for dest_host in dest_hosts:
+            peers = diameter_client.broadcastDiameterRequest(
+                requestType="SWX_RTR",
+                peerType="aaa",
+                imsi=imsi,
+                destinationRealm=diameter_realm,
+                destinationHost=dest_host,
+            )
+            peer_count = len(peers) if isinstance(peers, list) else 0
+            if peer_count:
+                sent += 1
+                _log(
+                    log_tool,
+                    redis_messaging,
+                    "info",
+                    f"[network_control] Broadcast SWx RTR for IMSI {imsi} to {dest_host} via {peer_count} peer(s)",
+                )
+            else:
+                warnings.append(f"SWx RTR to {dest_host} found no AAA/DRA peers for IMSI {imsi}")
+        if not sent:
+            warnings.append(f"SWx RTR broadcast found no AAA/DRA peers for IMSI {imsi}")
     except Exception as exc:
         msg = f"SWx RTR broadcast failed for IMSI {imsi}: {exc}"
         warnings.append(msg)
         _log(log_tool, redis_messaging, "error", f"[network_control] {msg}\n{traceback.format_exc()}")
+
+
+def _send_gx_session_release(
+    diameter_client,
+    database_client,
+    subscriber_info: dict,
+    imsi: str,
+    warnings: List[str],
+    log_tool=None,
+    redis_messaging=None,
+) -> None:
+    """Release every active Gx IP-CAN session for the subscriber.
+
+    TS 29.212 §4.5.9.6 (PCRF-initiated IP-CAN Session Termination): the PCRF
+    sends RAR with Session-Release-Cause; the PCEF answers RAA and follows with
+    a CCR-T. The existing CCR-T handler then emits the Rx ASR toward the P-CSCF
+    and clears the stored S-CSCF / P-CSCF / serving-APN state.
+
+    Session-Release-Cause UE_SUBSCRIPTION_REASON (1) per TS 29.212 §5.3.44 --
+    the subscription was disabled or removed.
+    """
+    subscriber_id = subscriber_info.get("subscriber_id")
+    if subscriber_id is None:
+        return
+
+    try:
+        serving_apns = database_client.Get_Serving_APNs(subscriber_id=subscriber_id)
+    except Exception as exc:
+        warnings.append(f"Failed to list serving APNs for IMSI {imsi}: {exc}")
+        return
+
+    for apn_name, apn_data in (serving_apns.get("apns") or {}).items():
+        if not apn_data:
+            continue
+        pcrf_session_id = apn_data.get("pcrf_session_id")
+        serving_pgw = apn_data.get("serving_pgw")
+        serving_pgw_realm = apn_data.get("serving_pgw_realm")
+        serving_pgw_peer = normalize_peer_hostname(apn_data.get("serving_pgw_peer"))
+        if not (pcrf_session_id and serving_pgw and serving_pgw_realm and serving_pgw_peer):
+            continue
+
+        sent = ""
+        try:
+            sent = diameter_client.sendDiameterRequest(
+                requestType="RAR",
+                hostname=serving_pgw_peer,
+                sessionId=pcrf_session_id,
+                servingPgw=serving_pgw,
+                servingRealm=serving_pgw_realm,
+                sessionReleaseCause=1,
+            )
+        except Exception as exc:
+            warnings.append(f"Gx session release for IMSI {imsi} APN {apn_name} failed: {exc}")
+            _log(log_tool, redis_messaging, "error", f"[network_control] {traceback.format_exc()}")
+
+        if sent:
+            _log(
+                log_tool,
+                redis_messaging,
+                "info",
+                f"[network_control] Sent Gx RAR (Session-Release-Cause) for IMSI {imsi} APN {apn_name} to {serving_pgw_peer}",
+            )
+            continue
+
+        # The PGW peer is not connected, so no CCR-T will arrive to trigger the
+        # Rx ASR. Abort the AF sessions directly instead of leaking them.
+        warnings.append(f"Gx peer {serving_pgw_peer} not connected for IMSI {imsi} APN {apn_name}; aborting Rx sessions directly")
+        try:
+            diameter_client.GxCCR3_to_RxSTR(imsi, apn_name)
+        except Exception as exc:
+            warnings.append(f"Rx ASR fallback for IMSI {imsi} APN {apn_name} failed: {exc}")
+            _log(log_tool, redis_messaging, "error", f"[network_control] {traceback.format_exc()}")
 
 
 def teardown_subscriber(
@@ -194,11 +326,11 @@ def teardown_subscriber(
     """
     Send HSS-initiated teardown messages for the given IMSI.
 
-    domains: subset of 'epc', 'ims', 'swx' (default: all three).
+    domains: subset of 'pcrf', 'epc', 'ims', 'swx' (default: all four).
     Returns a list of non-fatal warning strings.
     """
     warnings: List[str] = []
-    active_domains = set(domains or ("epc", "ims", "swx"))
+    active_domains = set(domains or ("pcrf", "epc", "ims", "swx"))
 
     subscriber_info: dict = {}
     ims_subscriber_info: dict = {}
@@ -217,6 +349,20 @@ def teardown_subscriber(
     resolved_mnc = mnc or getattr(diameter_client, "MNC", "999")
     ims_domain = get_ims_domain(resolved_mcc, resolved_mnc)
     resolved_realm = diameter_realm or subscriber_info.get("serving_mme_realm") or ims_subscriber_info.get("scscf_realm")
+
+    # Runs first: releasing the IP-CAN session lets the P-CSCF tear an in-progress
+    # call down cleanly (via the Rx ASR the CCR-T triggers) before the S6a CLR
+    # detaches the UE and the Cx RTR force-deregisters the S-CSCF.
+    if "pcrf" in active_domains:
+        _send_gx_session_release(
+            diameter_client,
+            database_client,
+            subscriber_info,
+            imsi,
+            warnings,
+            log_tool,
+            redis_messaging,
+        )
 
     if "epc" in active_domains:
         _send_clr(diameter_client, subscriber_info, imsi, warnings, log_tool, redis_messaging)

@@ -29,6 +29,19 @@ from rat import SubscriberRATRestriction, RAT
 from ast import literal_eval
 from urllib.parse import urlparse
 
+# SWx Server-Assignment-Type values (TS 29.229 clause 6.3.15, reused by TS 29.273).
+# Registration and profile-update types bind the serving 3GPP AAA Server to the
+# subscriber; de-registration types release that binding.
+SWX_SAT_REGISTRATION_TYPES = (1, 2, 3, 12, 13, 14)
+SWX_SAT_DEREGISTRATION_TYPES = (4, 5, 6, 7, 8, 9, 10, 11)
+
+# Lifetime of the swx_aaa_server:<imsi> binding used as SWx RTR Destination-Host.
+# Must not be shorter than the AAA server's established-session TTL
+# (AAA_SESSION_ESTABLISHED_TIMEOUT / ?ESTABLISHED_TTL_SEC, 7 days), otherwise the
+# HSS forgets the serving AAA while its SWm session is still live.
+SWX_AAA_BINDING_TTL_SEC = 604800
+
+
 class Diameter:
 
     def __init__(
@@ -1429,79 +1442,6 @@ class Diameter:
         
         return True
 
-
-    def deregisterApn(self, imsi: str=None, msisdn: str=None, apn: str=None) -> bool:
-        """
-        Revokes a given UE's session with the assigned PGW (If it exists), and sends a CLR to the MME.
-        """
-        try:
-            if imsi is None and msisdn is None:
-                return False
-
-            if imsi is not None:
-                subscriberDetails = self.database.Get_Subscriber(imsi=imsi)
-            if msisdn is not None:
-                subscriberDetails = self.database.Get_Subscriber(msisdn=msisdn)
-                imsi = subscriberDetails.get('imsi', '')
-        
-            if subscriberDetails is None:
-                return False
-            
-            subscriberId = subscriberDetails.get('subscriber_id', None)
-
-            # If a subscriber has an active serving apn, grab the pcrf session id for that apn and send a CCR-T, then a Registration Termination Request to the serving pgw peer.
-            if subscriberId is not None:
-                servingApns = self.database.Get_Serving_APNs(subscriber_id=subscriberId)
-                if len(servingApns.get('apns', {})) > 0:
-                    for apnKey, apnDict in servingApns['apns'].items():
-                        pcrfSessionId = None
-                        servingPgwPeer = None
-                        servingPgwRealm = None
-                        servingPgw = None
-                        for apnDataKey, apnDataValue in servingApns['apns'][apnKey].items():
-                            if apnDataKey == 'pcrf_session_id':
-                                pcrfSessionId = apnDataValue
-                            if apnDataKey == 'serving_pgw_peer':
-                                servingPgwPeer = apnDataValue
-                            if apnDataKey == 'serving_pgw_realm':
-                                servingPgwRealm = apnDataValue
-                            if apnDataKey == 'serving_pgw':
-                                servingPgwRealm = apnDataValue
-                            
-                        if pcrfSessionId is not None and servingPgwPeer is not None and servingPgwRealm is not None and servingPgw is not None:
-                            if ';' in servingPgwPeer:
-                                servingPgwPeer = servingPgwPeer.split(';')[0]
-                            
-                            self.logTool.log(service='HSS', level='debug', message=f"[diameter.py] [deregisterData] Sending CCR-T with Session-ID:{pcrfSessionId} to peer: {servingPgwPeer} {apnKey}", redisClient=self.redisMessaging)
-
-                            self.sendDiameterRequest(
-                            requestType='CCR',
-                            hostname=servingPgwPeer,
-                            imsi=imsi,
-                            destinationHost=servingPgw, 
-                            destinationRealm=servingPgwRealm,
-                            ccr_type=3,
-                            sessionId=pcrfSessionId,
-                            domain=servingPgwRealm
-                            )
-
-                            self.logTool.log(service='HSS', level='debug', message=f"[diameter.py] [deregisterData] Sending RTR to peer: {servingPgwPeer} {apnKey}", redisClient=self.redisMessaging)
-
-                            self.sendDiameterRequest(
-                            requestType='RTR',
-                            hostname=servingPgwPeer,
-                            imsi=imsi,
-                            destinationHost=servingPgw, 
-                            destinationRealm=servingPgwRealm, 
-                            domain=servingPgwRealm
-                            )
-
-                        self.database.Update_Serving_APN(imsi=imsi, apn=apnKey, pcrf_session_id=None, serving_pgw=None, subscriber_routing='')
-            
-            return True
-        except Exception as e:
-            self.logTool.log(service='HSS', level='error', message=f"[diameter.py] [deregisterIms] Error deregistering subscriber from IMS: {traceback.format_exc()}", redisClient=self.redisMessaging)
-            return False
 
     def deregisterIms(self, imsi=None, msisdn=None) -> bool:
         """
@@ -3182,6 +3122,7 @@ class Diameter:
             return response
 
         #Determine SAR Type & Store
+        User_Authorization_Type = None
         user_authorization_type_avp_data = self.get_avp_data(avps, 623)
         if user_authorization_type_avp_data:
             try:
@@ -3198,6 +3139,24 @@ class Diameter:
                     
             except Exception as E:
                 self.logTool.log(service='HSS', level='debug', message="Failed to get User_Authorization_Type AVP & Update_Serving_CSCF error: " + str(E), redisClient=self.redisMessaging)
+
+        # Refuse a disabled subscriber's registration. DE_REGISTRATION is exempt so
+        # stored S-CSCF state can still be cleared; the branch above normally
+        # returns early for it, but it raises when no S-CSCF is stored, so the type
+        # is checked explicitly here rather than relying on that return.
+        if User_Authorization_Type != 1:
+            try:
+                subscriber_enabled = (self.database.Get_Subscriber(imsi=imsi)).get('enabled', True)
+            except Exception:
+                subscriber_enabled = True
+            if not subscriber_enabled:
+                self.logTool.log(service='HSS', level='info',
+                                 message="Cx UAR: IMSI " + str(imsi) + " is disabled; rejecting with 5003",
+                                 redisClient=self.redisMessaging)
+                avp += self.generate_avp(268, 40, self.int_to_hex(5003, 4))
+                response = self.generate_diameter_packet("01", "40", 300, 16777216, packet_vars['hop-by-hop-identifier'], packet_vars['end-to-end-identifier'], avp)
+                return response
+
         self.logTool.log(service='HSS', level='debug', message="Got subscriber details: " + str(ims_subscriber_details), redisClient=self.redisMessaging)
         if ims_subscriber_details['scscf'] != None:
             self.logTool.log(service='HSS', level='debug', message="Already has SCSCF Assigned from DB: " + str(ims_subscriber_details['scscf']), redisClient=self.redisMessaging)
@@ -3299,6 +3258,27 @@ class Diameter:
             avp += self.generate_avp(297, 40, avp_experimental_result)                                      #AVP Experimental-Result(297)
             response = self.generate_diameter_packet("01", "40", 301, 16777217, packet_vars['hop-by-hop-identifier'], packet_vars['end-to-end-identifier'], avp)     #Generate Diameter packet
             return response
+
+        # Refuse to hand out a service profile for a disabled subscriber, but only
+        # for REGISTRATION (1) / RE_REGISTRATION (2). De-registration assignment
+        # types must still be processed below, otherwise the stored S-CSCF is never
+        # cleared and the next Cx RTR has no Destination-Host to target.
+        try:
+            requested_assignment_type = self.hex_to_int(self.get_avp_data(avps, 614)[0])
+        except Exception:
+            requested_assignment_type = None
+        if requested_assignment_type in (1, 2):
+            try:
+                subscriber_enabled = (self.database.Get_Subscriber(imsi=imsi)).get('enabled', True)
+            except Exception:
+                subscriber_enabled = True
+            if not subscriber_enabled:
+                self.logTool.log(service='HSS', level='info',
+                                 message="Cx SAR: IMSI " + str(imsi) + " is disabled; rejecting with 5003",
+                                 redisClient=self.redisMessaging)
+                avp += self.generate_avp(268, 40, self.int_to_hex(5003, 4))
+                response = self.generate_diameter_packet("01", "40", 301, 16777216, packet_vars['hop-by-hop-identifier'], packet_vars['end-to-end-identifier'], avp)
+                return response
 
         avp += self.generate_avp(1, 40, str(binascii.hexlify(str.encode(str(imsi) + '@' + str(domain))),'ascii'))
         #Cx-User-Data (XML)
@@ -3518,7 +3498,18 @@ class Diameter:
             return response
         
         self.logTool.log(service='HSS', level='debug', message="Got subscriber data for MAA OK", redisClient=self.redisMessaging)
-        
+
+        # An administratively disabled subscriber must not be issued IMS auth
+        # vectors. TS 29.228 defines no experimental code for this condition, so
+        # answer with base Result-Code DIAMETER_AUTHORIZATION_REJECTED (RFC 6733).
+        if not subscriber_details.get('enabled', True):
+            self.logTool.log(service='HSS', level='info',
+                             message="Cx MAR: IMSI " + str(imsi) + " is disabled; rejecting with 5003",
+                             redisClient=self.redisMessaging)
+            avp += self.generate_avp(268, 40, self.int_to_hex(5003, 4))
+            response = self.generate_diameter_packet("01", "40", 303, 16777216, packet_vars['hop-by-hop-identifier'], packet_vars['end-to-end-identifier'], avp)
+            return response
+
         plmn = self.EncodePLMN_from_IMSI(imsi)
 
         #Determine if SQN Resync is required & auth type to use
@@ -3674,6 +3665,13 @@ class Diameter:
                 imsi = username
 
             subscriber_details = self.database.Get_Subscriber(imsi=imsi)
+            if not subscriber_details.get('enabled', True):
+                self.logTool.log(service='HSS', level='info',
+                                 message="SWx MAR: IMSI " + str(imsi) + " is disabled; rejecting with 5003",
+                                 redisClient=self.redisMessaging)
+                avp += self.generate_avp(268, 40, self.int_to_hex(5003, 4))
+                response = self.generate_diameter_packet("01", "40", 303, 16777265, packet_vars['hop-by-hop-identifier'], packet_vars['end-to-end-identifier'], avp)
+                return response
         except Exception as e:
             self.logTool.log(service='HSS', level='debug', message="SWx MAR subscriber " + str(imsi) + " unknown: " + str(e), redisClient=self.redisMessaging)
             self.redisMessaging.sendMetric(serviceName='diameter', metricName='prom_diam_auth_event_count',
@@ -3780,6 +3778,30 @@ class Diameter:
 
         self.logTool.log(service='HSS', level='debug', message="SWx SAR: IMSI=" + str(imsi) + " assignment_type=" + str(server_assignment_type), redisClient=self.redisMessaging)
 
+        # De-registration releases the AAA binding. Done before any rejection path
+        # below so the binding cannot outlive the SWm session it points at.
+        if server_assignment_type in SWX_SAT_DEREGISTRATION_TYPES:
+            try:
+                # deleteQueue is RedisMessaging's generic key delete; there is no
+                # deleteValue counterpart to setValue/getValue.
+                self.redisMessaging.deleteQueue(queue=f"swx_aaa_server:{imsi}", usePrefix=False)
+                self.logTool.log(service='HSS', level='debug',
+                                 message="SWx SAR: released AAA binding for IMSI " + str(imsi),
+                                 redisClient=self.redisMessaging)
+            except Exception:
+                pass
+
+        # An administratively disabled subscriber must not be (re-)registered for
+        # non-3GPP access. De-registration types are exempt, otherwise the AAA can
+        # never tell the HSS that the session is gone (TS 29.273 §8.1.2.2).
+        if server_assignment_type in SWX_SAT_REGISTRATION_TYPES and not subscriber_details.get('enabled', True):
+            self.logTool.log(service='HSS', level='info',
+                             message="SWx SAR: IMSI " + str(imsi) + " is disabled; rejecting with 5003",
+                             redisClient=self.redisMessaging)
+            avp += self.generate_avp(268, 40, self.int_to_hex(5003, 4))
+            response = self.generate_diameter_packet("01", "40", 301, 16777265, packet_vars['hop-by-hop-identifier'], packet_vars['end-to-end-identifier'], avp)
+            return response
+
         # Per-interface APN allowlist: SWx uses subscriber.apn_list_swx (separate from S6a apn_list).
         # Per 3GPP TS 29.273 §5.2.2.4, when the subscriber has no non-3GPP subscription
         # (no APN allowed via SWx), reject with DIAMETER_ERROR_USER_NO_NON_3GPP_SUBSCRIPTION (5450).
@@ -3871,6 +3893,34 @@ class Diameter:
                                         metricLabels={"diameter_application_id": 16777265, "diameter_cmd_code": 301, "event": "Success", "imsi_prefix": str(imsi[0:6])},
                                         metricHelp='Diameter Authentication related Counters',
                                         metricExpiry=60, usePrefix=True, prefixHostname=self.hostname, prefixServiceName='metric')
+        # Bind 3GPP-AAA-Server-Name / Origin-Host so later HSS-initiated
+        # SWx RTR can set Destination-Host (TS 29.273 §8.1.2.3).
+        try:
+            aaa_host = None
+            aaa_name = self.get_avp_data(avps, 318)
+            if aaa_name:
+                aaa_host = binascii.unhexlify(aaa_name[0]).decode("utf-8")
+            if not aaa_host:
+                oh = self.get_avp_data(avps, 264)
+                if oh:
+                    candidate = binascii.unhexlify(oh[0]).decode("utf-8")
+                    if "aaa" in candidate.lower():
+                        aaa_host = candidate
+            if aaa_host and server_assignment_type in SWX_SAT_REGISTRATION_TYPES:
+                self.redisMessaging.setValue(
+                    key=f"swx_aaa_server:{imsi}",
+                    value=aaa_host,
+                    keyExpiry=SWX_AAA_BINDING_TTL_SEC,
+                    usePrefix=False,
+                )
+                self.logTool.log(
+                    service="HSS",
+                    level="info",
+                    message=f"SWx SAR bound 3GPP-AAA-Server-Name {aaa_host} for IMSI {imsi}",
+                    redisClient=self.redisMessaging,
+                )
+        except Exception:
+            pass
         response = self.generate_diameter_packet("01", "40", 301, 16777265, packet_vars['hop-by-hop-identifier'], packet_vars['end-to-end-identifier'], avp)
         return response
 
@@ -6164,11 +6214,25 @@ class Diameter:
         return response
 
     #3GPP Gx - Re Auth Request
-    def Request_16777238_258(self, sessionId, servingPgw, servingRealm, chargingRules=None, ueIp=None, chargingRuleAction='install', chargingRuleName=None):
+    def Request_16777238_258(self, sessionId, servingPgw, servingRealm, chargingRules=None, ueIp=None, chargingRuleAction='install', chargingRuleName=None, sessionReleaseCause=None):
         avp = ''
         self.logTool.log(service='HSS', level='debug', message=f"[diameter.py] [Request_16777238_258] [RAR] Creating Re Auth Request", redisClient=self.redisMessaging)
 
         avp += self.generate_avp(263, 40, str(binascii.hexlify(str.encode(sessionId)),'ascii'))          #Session-Id set AVP
+
+        # PCRF-initiated IP-CAN session termination (TS 29.212 §4.5.9.6): the RAR
+        # carries Session-Release-Cause (AVP 1045) and no charging rules; the PCEF
+        # answers RAA and then tears the session down with a CCR-T.
+        if sessionReleaseCause is not None:
+            self.logTool.log(service='HSS', level='debug', message=f"[diameter.py] [Request_16777238_258] [RAR] Session-Release-Cause: {sessionReleaseCause}", redisClient=self.redisMessaging)
+            avp += self.generate_vendor_avp(1045, "c0", 10415, self.int_to_hex(int(sessionReleaseCause), 4))
+            avp += self.generate_avp(264, 40, self.OriginHost)                                               #Origin Host
+            avp += self.generate_avp(296, 40, self.OriginRealm)                                              #Origin Realm
+            avp += self.generate_avp(293, 40, self.string_to_hex(servingPgw))                                #Destination Host
+            avp += self.generate_avp(283, 40, self.string_to_hex(servingRealm))                              #Destination Realm
+            avp += self.generate_avp(258, 40, format(int(16777238),"x").zfill(8))                            #Auth-Application-ID Gx
+            avp += self.generate_avp(285, 40, format(int(0),"x").zfill(8))                                   #Re-Auth Request Type
+            return self.generate_diameter_packet("01", "c0", 258, 16777238, self.generate_id(4), self.generate_id(4), avp)
 
         #Setup Charging Rule
         self.logTool.log(service='HSS', level='debug', message=chargingRules, redisClient=self.redisMessaging)
@@ -6436,6 +6500,13 @@ class Diameter:
                 )
                 
                 return self.Respond_ResultCode(packet_vars, avps, 5001)
+
+            # No GBA bootstrapping for an administratively disabled subscriber.
+            if not subscriber_details.get('enabled', True):
+                self.logTool.log(service='HSS', level='info',
+                                message=f"Zh MAR: IMSI {imsi} is disabled; rejecting with 5003",
+                                redisClient=self.redisMessaging)
+                return self.Respond_ResultCode(packet_vars, avps, 5003)
         except Exception as e:
             self.logTool.log(service='HSS', level='error', 
                             message=f"Database error: {str(e)}",

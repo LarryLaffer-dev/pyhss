@@ -7,6 +7,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.7.12] - 2026-09-04
+
+### Added
+
+- New `pcrf` teardown domain (default on subscriber delete, `PATCH /subscriber` with `enabled: false`, `GET /oam/deregister/<imsi>` and `POST /geored/network_teardown`): sends a Gx RAR carrying Session-Release-Cause `UE_SUBSCRIPTION_REASON` per serving APN (TS 29.212 §4.5.9.6), so the PCEF tears the IP-CAN session down with a CCR-T and the existing handler aborts the P-CSCF's Rx AF session. When the Gx peer is not connected the Rx ASR is sent directly instead of leaking the AF session (image `hss:1.7.12`).
+
+### Changed
+
+- Cx MAR, UAR and SAR, and the Zh/GBA MAR now reject an administratively disabled subscriber with Result-Code 5003 (`DIAMETER_AUTHORIZATION_REJECTED`), matching the SWx handlers. De-registration requests are exempt (Cx UAR `User-Authorization-Type` `DE_REGISTRATION`, Cx SAR assignment types other than `REGISTRATION`/`RE_REGISTRATION`) so stored S-CSCF state can still be cleared (image `hss:1.7.12`).
+- SWx RTR is now sent only to the 3GPP AAA Server bound by the SAR (TS 29.273 §8.1.2.3) instead of additionally fanning out to every host in `SWX_AAA_DESTINATION_HOSTS`; the list is now a fallback used only when no binding exists (image `hss:1.7.12`).
+- The `swx_aaa_server:<imsi>` binding is written only for registration/update Server-Assignment-Types, its TTL raised from 24 h to 7 days to match the AAA's established-session lifetime, and it is deleted on de-registration types (image `hss:1.7.12`).
+
+### Fixed
+
+- SWx SAR no longer rejects a disabled subscriber's de-registration with 5003: the `enabled` check ran before `Server-Assignment-Type` was parsed, so `USER_DEREGISTRATION` was refused and the AAA binding was never released (image `hss:1.7.12`).
+
+### Removed
+
+- Dead `deregisterApn()` helper. It had no callers and could never send a message (`serving_pgw` was assigned to the realm variable, so its guard was always false), and it used a PCRF-originated CCR, which TS 29.212 does not define; the `pcrf` teardown domain supersedes it (image `hss:1.7.12`).
+
+## [1.7.11] - 2026-09-04
+
+### Fixed
+
+- SWx MAR/SAR now reject a disabled subscriber with Result-Code 5003 (`DIAMETER_AUTHORIZATION_REJECTED`) so VoWiFi cannot re-attach after `enabled: false` (image `hss:1.7.11`).
+
+## [1.7.10] - 2026-09-03
+
+### Fixed
+
+- SWx RTR now sets Destination-Host to the bound 3GPP-AAA-Server-Name (from SAR) or `SWX_AAA_DESTINATION_HOSTS`, so the DRA does not loop Application-Id 16777265 back to the HSS (image `hss:1.7.10`).
+
+## [1.7.9] - 2026-09-03
+
+### Fixed
+
+- Provisioning API now logs Diameter-relay HTTP status and treats non-2xx as failure; SWx RTR is no longer logged as sent when the Diameter node has no AAA/DRA peers (image `hss:1.7.9`).
+
 ## [1.7.8] - 2026-09-03
 
 ### Added

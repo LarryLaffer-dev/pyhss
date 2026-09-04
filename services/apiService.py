@@ -195,8 +195,14 @@ def relay_to_diameter_nodes(path, payload):
             urlHost = f"[{address}]" if ':' in address else address
             url = f"{parsed.scheme}://{urlHost}:{port}{path}"
             try:
-                requests.post(url, json=payload, timeout=2)
-                logTool.log(service='API', level='debug', message=f"[API] Diameter relay sent to {url}", redisClient=redisMessaging)
+                resp = requests.post(url, json=payload, timeout=5)
+                if resp.status_code >= 400:
+                    logTool.log(
+                        service='API',
+                        level='warning',
+                        message=f"[API] Diameter relay to {url} returned HTTP {resp.status_code}: {resp.text[:200]}",
+                        redisClient=redisMessaging,
+                    )
             except Exception as e:
                 logTool.log(service='API', level='warning', message=f"[API] Diameter relay to {url} failed: {e}", redisClient=redisMessaging)
 
@@ -748,7 +754,7 @@ class PyHSS_SUBSCRIBER_Get(Resource):
             imsi = subscriber_data.get('imsi')
             warnings = []
             if imsi:
-                warnings = teardown_subscriber_and_relay(imsi, ['epc', 'ims', 'swx'])
+                warnings = teardown_subscriber_and_relay(imsi, ['pcrf', 'epc', 'ims', 'swx'])
             data = databaseClient.DeleteObj(SUBSCRIBER, subscriber_id, False, operation_id)
             if warnings:
                 data = dict(data) if isinstance(data, dict) else {'result': data}
@@ -784,7 +790,7 @@ class PyHSS_SUBSCRIBER_Get(Resource):
             if 'enabled' in json_data and json_data['enabled'] == False:
                 imsi = data.get('imsi') or existing_subscriber.get('imsi')
                 if imsi:
-                    warnings = teardown_subscriber_and_relay(imsi, ['epc', 'ims', 'swx'])
+                    warnings = teardown_subscriber_and_relay(imsi, ['pcrf', 'epc', 'ims', 'swx'])
 
             if warnings:
                 data = dict(data) if isinstance(data, dict) else {'result': data}
@@ -1588,7 +1594,7 @@ class PyHSS_OAM_Deregister(Resource):
             imsSubscriberInfo = databaseClient.Get_IMS_Subscriber(imsi=str(imsi))
             subscriberId = subscriberInfo.get('subscriber_id', None)
 
-            warnings = teardown_subscriber_and_relay(imsi, ['epc', 'ims', 'swx'])
+            warnings = teardown_subscriber_and_relay(imsi, ['pcrf', 'epc', 'ims', 'swx'])
 
             # If a subscriber has an active serving apn, grab the pcrf session id for that apn and send a CCR-T, then a Registration Termination Request to the serving pgw peer.
             if subscriberId is not None:
@@ -2282,16 +2288,16 @@ class PyHSS_Geored_Sh_Profile_Updated(Resource):
 
 @ns_geored.route('/network_teardown')
 class PyHSS_Geored_Network_Teardown(Resource):
-    @ns_geored.doc('Execute HSS-initiated CLR/RTR/SWx-RTR using this node Diameter peer table')
+    @ns_geored.doc('Execute HSS-initiated Gx RAR/CLR/RTR/SWx-RTR using this node Diameter peer table')
     @no_auth_required
     def post(self):
-        '''Send S6a CLR, Cx RTR and/or SWx RTR for the given IMSI from this Diameter node'''
+        '''Send Gx session release, S6a CLR, Cx RTR and/or SWx RTR for the given IMSI from this Diameter node'''
         try:
             json_data = request.get_json(force=True)
             imsi = json_data.get('imsi')
             if not imsi:
                 return {'error': 'imsi is required'}, 400
-            domains = json_data.get('domains') or ['epc', 'ims', 'swx']
+            domains = json_data.get('domains') or ['pcrf', 'epc', 'ims', 'swx']
             warnings = teardown_subscriber(
                 diameterClient,
                 databaseClient,

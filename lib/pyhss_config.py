@@ -64,6 +64,9 @@ def _apply_env_overrides(cfg):
     rx_notify = os.environ.get("RX_NOTIFY_ENDPOINTS")
     if rx_notify is not None:
         hss["rx_notify_endpoints"] = _split_urls(rx_notify)
+    swx_aaa = os.environ.get("SWX_AAA_DESTINATION_HOSTS")
+    if swx_aaa is not None:
+        hss["swx_aaa_destination_hosts"] = [h.strip() for h in swx_aaa.replace(" ", ",").split(",") if h.strip()]
 
     return cfg
 
